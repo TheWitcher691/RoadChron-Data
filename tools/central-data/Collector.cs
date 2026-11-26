@@ -50,11 +50,11 @@ internal static class Collector
             // Never republish restricted legacy observations, even if signed by this owner.
             var oldAts=Approved(prior?.Ats,true,now);
             var oldEts=Approved(prior?.Ets2,false,now);
-            var oldQuotes=prior?.AdBlue.Where(q=>q.Country=="E"&&q.Source==AdBlueRealPrices.SpainUrl).ToList()??[];
+            var oldQuotes=prior?.AdBlue.Where(q=>AdBlueRealPrices.ApprovedQuote(q)||(AdBlueRealPrices.VatEnabled&&AdBlueRealPrices.VatQuote(q))).ToList()??[];
             bool previousApproved=prior!=null&&prior.Def.Count==0&&oldQuotes.Count==prior.AdBlue.Count&&
                 (prior.Ats==null||oldAts?.Prices.Count==prior.Ats.Prices.Count)&&
                 (prior.Ets2==null||oldEts?.Prices.Count==prior.Ets2.Prices.Count);
-            if(previousApproved&&prior!.GeneratedUtc>=now.AddHours(-20)){Console.WriteLine("Already published recently; no requests sent.");return 0;}
+            if(previousApproved&&prior!.GeneratedUtc>=now.AddDays(-6)){Console.WriteLine("Already published recently; no requests sent.");return 0;}
             string root=Path.Combine(Path.GetTempPath(),"roadchron-collector-"+Guid.NewGuid().ToString("N"));Directory.CreateDirectory(root);
             using var cts=new CancellationTokenSource(TimeSpan.FromMinutes(20));var ct=cts.Token;
             try {
@@ -63,21 +63,44 @@ internal static class Collector
                 var ats=await Try("EIA",()=>ReadUsAsync(http,ct),ct);
                 var ets=await Try("EU EnergyPrices",()=>ReadEuropeAsync(http,root,ct),ct);
                 var fx=await Try("ECB",async()=>AdBlueRealPrices.ParseFx(await http.GetStringAsync(AdBlueRealPrices.FxUrl,ct),DateTime.UtcNow),ct);
+                if(fx!=null){
+                    var uk=await Try("UK DESNZ",()=>ReadUkAsync(http,fx,ct),ct);
+                    var norway=await Try("Norway SSB",async()=>ParseNorway(await http.GetStringAsync(RealFuelPrices.NorwayData,ct),fx,DateTime.UtcNow),ct);
+                    ets=Merge(uk,ets,false,DateTime.UtcNow);
+                    ets=Merge(norway,ets,false,DateTime.UtcNow);
+                }
                 var quote=await Try("MITECO",async()=>{
                     var text=await http.GetStringAsync(AdBlueRealPrices.SpainUrl,ct);var checkedAt=DateTime.UtcNow;
                     if(AdBlueRealPrices.ParseSpain(text,checkedAt,out var published) is not decimal eur||published==null)
                         throw new InvalidDataException("No current public Spanish AdBlue observations.");
                     return new AdBlueRealPrices.Quote("E","EUR",eur,checkedAt,AdBlueRealPrices.SpainUrl,published);
                 },ct);
+                // Public Romania station endpoint has a weekly per-IP quota. No retries or manual workflow calls.
+                AdBlueRealPrices.Quote? romania=null;
+                if(Environment.GetEnvironmentVariable("ROADCHRON_ROMANIA_SCHEDULED")=="true" &&
+                   (fx??prior?.Fx)?.Rates.ContainsKey("RON")==true){
+                    romania=await Try("PretCarburant RO",async()=>{
+                        var text=await http.GetStringAsync(AdBlueRealPrices.RomaniaUrl,ct);
+                        return AdBlueRealPrices.ParseRomania(text,DateTime.UtcNow)??
+                            throw new InvalidDataException("No sufficient current Romanian pump AdBlue observations (minimum 3 unique stations).");
+                    },ct);
+                }
+                var vat=new List<AdBlueRealPrices.Quote>();
+                if(AdBlueRealPrices.VatEnabled){
+                    foreach(var source in AdBlueRealPrices.VatSources){
+                        var catalogue=await Try("VATservice "+source.Country,async()=>AdBlueRealPrices.ParseVat(await http.GetStringAsync(source.Url,ct),source,fx??prior?.Fx,DateTime.UtcNow)??throw new InvalidDataException("Invalid catalogue price or FX."),ct);
+                        if(catalogue!=null)vat.Add(catalogue);
+                    }
+                }
                 now=DateTime.UtcNow;
-                if(ats==null&&ets==null&&fx==null&&quote==null)throw new InvalidDataException("All approved sources failed; previous publication preserved.");
-                var quotes=CentralPriceFeed.MergeAdBlue(oldQuotes,quote==null?[]:new[]{quote},now);
+                if(ats==null&&ets==null&&fx==null&&quote==null&&romania==null&&vat.Count==0)throw new InvalidDataException("All approved sources failed; previous publication preserved.");
+                var quotes=CentralPriceFeed.MergeAdBlue(oldQuotes,new[]{quote,romania}.OfType<AdBlueRealPrices.Quote>().Concat(vat),now);
                 var rates=fx??prior?.Fx;
                 var payload=new CentralPriceFeed.Payload(1,now,Merge(ats,oldAts,true,now),Merge(ets,oldEts,false,now),
                     quotes,new(),AdBlueRealPrices.ValidFx(rates,now)?rates:null);
                 string signed=CentralPriceFeed.Sign(payload,signing);CentralPriceFeed.Verify(signed,config.PublicKeyPem,now);
                 AdBlueRealPrices.Atomic(Path.GetFullPath(output),signed);
-                Console.WriteLine($"Published {payload.Ats?.Prices.Count??0} ATS (includes labelled regional estimates), {payload.Ets2?.Prices.Count??0} ETS2, {payload.AdBlue.Count} AdBlue observations, 0 DEF states; FX {payload.Fx?.Rates.Count??0}.");return 0;
+                Console.WriteLine($"Published {payload.Ats?.Prices.Count??0} ATS (includes labelled regional estimates), {payload.Ets2?.Prices.Count??0} ETS2, {payload.AdBlue.Count} AdBlue observations, 0 direct DEF states (client uses EIA proxy index); FX {payload.Fx?.Rates.Count??0}.");return 0;
             } finally { try{Directory.Delete(root,true);}catch{} }
         }catch(Exception ex){Console.Error.WriteLine(ex.Message);if(args.Length>0 && args[0]=="keygen")Console.Error.WriteLine(ex.StackTrace);return 1;}
     }
@@ -100,7 +123,7 @@ internal static class Collector
     {
         if(!RealFuelPrices.ValidFeed(feed,ats,now))return null;
         var prices=feed!.Prices.Where(p=>feed.DateFor(p.Key).Date>=now.Date.AddDays(-30)&&
-            feed.Sources?.GetValueOrDefault(p.Key)==(ats?RealFuelPrices.EiaSource:RealFuelPrices.EtsSource)).ToDictionary(p=>p.Key,p=>p.Value);
+            (ats?feed.Sources?.GetValueOrDefault(p.Key)==RealFuelPrices.EiaSource:feed.Sources?.GetValueOrDefault(p.Key) is RealFuelPrices.EtsSource or RealFuelPrices.UkSource or RealFuelPrices.NorwaySource)).ToDictionary(p=>p.Key,p=>p.Value);
         if(prices.Count==0)return null;
         var dates=prices.Keys.ToDictionary(k=>k,feed.DateFor);
         var estimated=feed.Estimated?.Where(p=>prices.ContainsKey(p.Key)).ToDictionary(p=>p.Key,p=>p.Value);
@@ -156,6 +179,45 @@ internal static class Collector
         return new(newest, prices, dates,sources);
     }
 
+    private static RealFuelPrices.Feed EuropeanOne(string country,string source,DateTime date,decimal petrol,decimal diesel,decimal rate,DateTime now){
+        if(rate<=0||date.Date>now.Date||date.Date<now.Date.AddDays(-30))throw new InvalidDataException("Invalid observation date or rate.");
+        var feed=new RealFuelPrices.Feed(date,new(){[country]=new(petrol/rate,diesel/rate)},new(){[country]=date},new(){[country]=source});
+        if(!RealFuelPrices.ValidFeed(feed,false,now))throw new InvalidDataException("Invalid country price.");return feed;
+    }
+    private static async Task<RealFuelPrices.Feed> ReadUkAsync(HttpClient http,AdBlueRealPrices.Fx fx,CancellationToken ct){
+        var page=await http.GetStringAsync(RealFuelPrices.UkSource,ct);
+        var links=Regex.Matches(page,"href\\s*=\\s*[\"']([^\"']+)[\"']",RegexOptions.IgnoreCase,TimeSpan.FromSeconds(3)).Cast<Match>()
+            .Select(m=>WebUtility.HtmlDecode(m.Groups[1].Value)).Where(s=>Uri.TryCreate(s,UriKind.Absolute,out var uri)&&PublicDataHttp.UkCsvAllowed(uri)).Distinct().ToArray();
+        if(links.Length!=1)throw new InvalidDataException("Unique UK current CSV not found.");
+        return ParseUk(await http.GetStringAsync(links[0],ct),fx,DateTime.UtcNow);
+    }
+    private static RealFuelPrices.Feed ParseUk(string csv,AdBlueRealPrices.Fx fx,DateTime now){
+        using var parser=new Microsoft.VisualBasic.FileIO.TextFieldParser(new StringReader(csv.TrimStart('\uFEFF')));
+        parser.SetDelimiters(",");parser.HasFieldsEnclosedInQuotes=true;
+        var h=parser.ReadFields()??[];
+        if(h.Length<3||h[0]!="Date"||h[1]!="ULSP (Ultra low sulphur unleaded petrol) Pump price in pence/litre"||h[2]!="ULSD (Ultra low sulphur diesel) Pump price in pence/litre")throw new InvalidDataException("UK CSV units or layout changed.");
+        var latest=DateTime.MinValue;decimal petrol=0,diesel=0;
+        while(!parser.EndOfData){var row=parser.ReadFields()??[];if(row.Length!=h.Length||!DateTime.TryParseExact(row[0],"dd/MM/yyyy",CultureInfo.InvariantCulture,DateTimeStyles.None,out var date)||date<=latest||date>now.Date)continue;
+            if(!decimal.TryParse(row[1],NumberStyles.AllowDecimalPoint,CultureInfo.InvariantCulture,out var p)||!decimal.TryParse(row[2],NumberStyles.AllowDecimalPoint,CultureInfo.InvariantCulture,out var d))continue;
+            latest=date;petrol=p/100;diesel=d/100;
+        }
+        if(latest<now.Date.AddDays(-14)||!fx.Rates.TryGetValue("GBP",out var rate))throw new InvalidDataException("No recent UK price or GBP rate.");
+        return EuropeanOne("unitedkingdom",RealFuelPrices.UkSource,latest,petrol,diesel,rate,now);
+    }
+    private static RealFuelPrices.Feed ParseNorway(string json,AdBlueRealPrices.Fx fx,DateTime now){
+        using var doc=JsonDocument.Parse(json);var root=doc.RootElement;var dims=root.GetProperty("dimension");
+        var ids=root.GetProperty("id").EnumerateArray().Select(x=>x.GetString()).ToArray();var sizes=root.GetProperty("size").EnumerateArray().Select(x=>x.GetInt32()).ToArray();
+        if(ids.Length!=3||sizes.Length!=3||ids.Distinct().Count()!=3||!ids.Contains("PetroleumProd")||!ids.Contains("Tid")||!ids.Contains("ContentsCode")||sizes[Array.IndexOf(ids,"PetroleumProd")]!=2||sizes[Array.IndexOf(ids,"Tid")]!=1||sizes[Array.IndexOf(ids,"ContentsCode")]!=1)throw new InvalidDataException("SSB dimensions changed.");
+        var products=dims.GetProperty("PetroleumProd").GetProperty("category").GetProperty("index");
+        var times=dims.GetProperty("Tid").GetProperty("category").GetProperty("index");
+        var metric=dims.GetProperty("ContentsCode").GetProperty("category");
+        if(!metric.GetProperty("index").TryGetProperty("Priser",out _))throw new InvalidDataException("SSB price series absent.");
+        var month=times.EnumerateObject().Single().Name;
+        if(!DateTime.TryParseExact(month,"yyyy'M'MM",CultureInfo.InvariantCulture,DateTimeStyles.None,out var date)||!fx.Rates.TryGetValue("NOK",out var rate))throw new InvalidDataException("SSB date or FX missing.");
+        var values=root.GetProperty("value");if(values.GetArrayLength()!=2)throw new InvalidDataException("SSB values changed.");
+        int p=products.GetProperty("031").GetInt32(),d=products.GetProperty("035").GetInt32();if(p==d||p<0||p>1||d<0||d>1)throw new InvalidDataException("SSB product order invalid.");
+        return EuropeanOne("norway",RealFuelPrices.NorwaySource,date.AddMonths(1).AddDays(-1),values[p].GetDecimal(),values[d].GetDecimal(),rate,now);
+    }
     private static readonly string[] PaddGroups = [
         "newenglandpadda|connecticut maine massachusetts newhampshire rhodeisland vermont",
         "centralatlanticpaddb|delaware districtofcolumbia maryland newjersey newyork pennsylvania",
@@ -237,6 +299,10 @@ internal static class Collector
         string Row(string name,string value)=>"<tr><td>"+name+"</td>"+string.Concat(Enumerable.Repeat("<td>"+value+"</td>",6))+"<td>History</td></tr>";
         var table=ParseEia(header+Row("U.S.","4.00")+Row("Rocky Mountain (PADD 4)","4.50")+Row("California","5.00")+"</table>",now);
         var feed=BuildUs([table,table,table,table]);
+        var fx=new AdBlueRealPrices.Fx(now,now,new(){["GBP"]=.8m,["NOK"]=10m});
+        var uk=ParseUk("Date,ULSP (Ultra low sulphur unleaded petrol) Pump price in pence/litre,ULSD (Ultra low sulphur diesel) Pump price in pence/litre\n23/11/2026,120,160",fx,now);
+        Check(uk.Prices["unitedkingdom"].Diesel==2m,"UK pence and GBP conversion");
+        Check(PublicDataHttp.CollectorAllowed(new(RealFuelPrices.NorwayData))&&!PublicDataHttp.CollectorAllowed(new(RealFuelPrices.NorwayData+"&other=1")),"fixed SSB query only");
         Check(Regions.Count==51,"all states mapped exactly once");
         Check(feed.Prices.Count==51&&feed.Date==new DateTime(2026,11,23),"EIA latest observation date and coverage");
         Check(!feed.IsEstimated("california","Diesel")&&feed.IsEstimated("idaho","Diesel"),"direct and estimated prices kept separate");
@@ -244,8 +310,29 @@ internal static class Collector
         Check(RealFuelPrices.ValidFeed(feed,true,now),"estimated feed valid");
         Check(PublicDataHttp.CollectorAllowed(new(RealFuelPrices.EiaSource))&&!PublicDataHttp.CollectorAllowed(new(RealFuelPrices.AtsSource))&&!PublicDataHttp.CollectorAllowed(new(RealFuelPrices.AmzsSource))&&!PublicDataHttp.CollectorAllowed(new(DefRealPrices.PilotSource)),"collector denies legacy providers");
         Check(Approved(new(now,new(){["california"]=new(1m,1m)},null,new(){["california"]=RealFuelPrices.AtsSource}),true,now)==null,"restricted signed prior data excluded");
+        string RowRo(string id,string price,string date,string extra="")=>"{\"id\":\""+id+"\",\"tip\":\"adblue\",\"pret\":"+price+",\"observat_la\":\""+date+"\""+extra+"}";
+        string Ro(params string[] rows)=>"{\"status\":\"ok\",\"statii\":["+string.Join(",",rows)+"]}";
+        var r1=RowRo("a","3","2026-11-25");var r2=RowRo("b","4","2026-11-26");var r3=RowRo("c","5","2026-11-24");
+        var ro=AdBlueRealPrices.ParseRomania(Ro(r1,r2,r3,r1,RowRo("d","20","2026-11-25",",\"nesigur\":true"),RowRo("e","10","2026-10-01")),now);
+        Check(ro is {Country:"RO",Currency:"RON",Local:4m}&&ro.Published==new DateTime(2026,11,24),"RO current unique station mean and oldest observation date");
+        Check(AdBlueRealPrices.ParseRomania(Ro(r1,r2),now)==null,"RO small sample rejected");
+        Check(AdBlueRealPrices.ParseRomania(Ro(r1,r2,r3,RowRo("c","6","2026-11-25")),now)==null,"RO conflicting duplicates excluded");
+        Check(PublicDataHttp.CollectorAllowed(new(AdBlueRealPrices.RomaniaUrl))&&!PublicDataHttp.CollectorAllowed(new(AdBlueRealPrices.RomaniaUrl+"&other=1")),"RO exact query only");
+        Check(!AdBlueRealPrices.ApprovedQuote(new("PL","PLN",3,now,AdBlueRealPrices.Sources.First(s=>s.Country=="PL").Url)),"unlicensed HTML remains excluded");
+        var vatSource=AdBlueRealPrices.VatSources.First(x=>x.Country=="LV");
+        var vat=AdBlueRealPrices.ParseVat(" 0,914 EUR ",vatSource,null,now);
+        Check(vat is {Local:.914m}&&AdBlueRealPrices.VatQuote(vat),"VATservice strict decimal fixture");
+        Check(AdBlueRealPrices.ParseVat("<html>0.914 USD</html>",vatSource,null,now)==null,"VATservice rejects wrong currency");
+        Check(AdBlueRealPrices.ParseVat("<body>0,914 EUR</body>",vatSource,null,now) is {Local:.914m},"VATservice basic HTML wrapper");
+        Check(AdBlueRealPrices.ParseVat("error 500",vatSource,null,now)==null,"VATservice rejects error response");
+        Check(PublicDataHttp.CollectorAllowed(new(vatSource.Url))==AdBlueRealPrices.VatEnabled,"VATservice opt-in network policy");
+        var index=AdBlueRealPrices.Compute([new("E","EUR",1m,now,AdBlueRealPrices.SpainUrl,now)],null,now);
+        Check(index["E"].Kind=="public"&&index["PL"].Kind=="index"&&index["PL"].Eur==.85m,"EU measured priority and labelled index");
+        var defIndex=DefRealPrices.Compute(new(),now,feed);
+        Check(defIndex.Count==52&&defIndex.Values.All(x=>x.Kind=="index"&&x.Samples==0)&&defIndex["CA"].UsdPerGallon>defIndex["TX"].UsdPerGallon,"DEF EIA proxy is labelled estimate, all states");
         using var key=ECDsa.Create(ECCurve.NamedCurves.nistP256);
-        var payload=new CentralPriceFeed.Payload(1,now,feed,null,[],new(),null);
+        var payload=new CentralPriceFeed.Payload(1,now,feed,null,[ro!],new(),null);
+        Check(CentralPriceFeed.Verify(CentralPriceFeed.Sign(payload,key),key.ExportSubjectPublicKeyInfoPem(),now).AdBlue.Single().Country=="RO","RO signed feed round trip");
         Check(CentralPriceFeed.Verify(CentralPriceFeed.Sign(payload,key),key.ExportSubjectPublicKeyInfoPem(),now).Ats!.IsEstimated("idaho","Diesel"),"signed estimates round trip");
     }
 }

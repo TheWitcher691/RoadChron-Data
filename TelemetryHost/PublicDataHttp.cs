@@ -28,7 +28,7 @@ internal static class PublicDataHttp
         DefaultProxyCredentials=null, AutomaticDecompression=DecompressionMethods.None }, central)) {
         Timeout = TimeSpan.FromSeconds(seconds), MaxResponseContentBufferSize = maxBytes };
     private static readonly HashSet<string> Feeds = new(
-        new[] { AdBlueRealPrices.FxUrl, AdBlueRealPrices.SpainUrl, RealFuelPrices.AtsSource, RealFuelPrices.EtsSource, RealFuelPrices.AmzsSource, DefRealPrices.PilotSource }
+        new[] { AdBlueRealPrices.FxUrl, AdBlueRealPrices.SpainUrl, RealFuelPrices.AtsSource, RealFuelPrices.EtsSource, RealFuelPrices.AmzsSource, DefRealPrices.PilotSource, RealFuelPrices.UkSource, RealFuelPrices.NorwaySource }
             .Concat(RealFuelPrices.EiaPages)
             .Concat(AdBlueRealPrices.Sources.Select(source => source.Url))
             .Concat(RealFuelPrices.EuropeanCountryCodes.Values.Select(country => RealFuelPrices.EtsSource + "/" + country))
@@ -47,10 +47,11 @@ internal static class PublicDataHttp
         return match.Success && DefRealPrices.Neighbours.ContainsKey(match.Groups["state"].Value.ToUpperInvariant());
     }
     // Publisher policy is intentionally narrower than legacy provenance validation.
-    internal static bool CollectorAllowed(Uri? uri) => Allowed(uri) && uri != null &&
+    internal static bool UkCsvAllowed(Uri? uri)=>uri is {IsAbsoluteUri:true}&&uri.Scheme=="https"&&uri.IsDefaultPort&&uri.UserInfo.Length==0&&uri.Query.Length==0&&uri.Fragment.Length==0&&uri.Host=="assets.publishing.service.gov.uk"&&Regex.IsMatch(uri.AbsolutePath,@"\A/media/[a-f0-9]{24}/(?:CSV__2018_-__|weekly_road_fuel_prices_[0-9]{6})\.csv\z");
+    internal static bool CollectorAllowed(Uri? uri) => uri is {IsAbsoluteUri:true} && (UkCsvAllowed(uri)||(AdBlueRealPrices.VatEnabled&&AdBlueRealPrices.VatSources.Any(s=>s.Url==uri.AbsoluteUri))||uri.AbsoluteUri==new Uri(AdBlueRealPrices.RomaniaUrl).AbsoluteUri||uri.AbsoluteUri==new Uri(RealFuelPrices.NorwayData).AbsoluteUri||(Allowed(uri) &&
         (uri.AbsoluteUri == AdBlueRealPrices.FxUrl || uri.AbsoluteUri == AdBlueRealPrices.SpainUrl ||
          RealFuelPrices.EiaPages.Contains(uri.AbsoluteUri, StringComparer.Ordinal) ||
-         uri.AbsoluteUri == RealFuelPrices.EtsSource || RealFuelPrices.EuropeanCountryCodes.Values.Any(c=>uri.AbsoluteUri==RealFuelPrices.EtsSource+"/"+c));
+         uri.AbsoluteUri == RealFuelPrices.UkSource || uri.AbsoluteUri == RealFuelPrices.EtsSource || RealFuelPrices.EuropeanCountryCodes.Values.Any(c=>uri.AbsoluteUri==RealFuelPrices.EtsSource+"/"+c))));
     internal static bool AllowedSource(string? source) => Uri.TryCreate(source,UriKind.Absolute,out var uri)&&Allowed(uri);
     // Allowed() describes source provenance; only the collector build may contact those sources.
     internal sealed class Gate(string root, HttpMessageHandler transport, Uri? central = null) : DelegatingHandler(transport)

@@ -68,20 +68,32 @@ internal static class DefRealPrices
         }
         return states.ToDictionary(p=>p.Key,p=>new Observation(p.Value.Average(),checkedUtc,[PilotSource],p.Value.Count));
     }
-    internal static Dictionary<string,Price> Compute(Dictionary<string,Observation> observations,DateTime now) {
-        var direct=observations.Where(k=>Neighbours.ContainsKey(k.Key)&&k.Value!=null&&Valid(k.Value.UsdPerGallon)&&k.Value.Checked<=now.AddMinutes(5)&&k.Value.Checked>=now.AddDays(-30)&&k.Value.Sources is {Length:>0 and <=3}).ToDictionary(k=>k.Key,k=>new Price(k.Value.UsdPerGallon,k.Value.Checked>=now.AddHours(-24)?"public":"cached",k.Value.Samples is >0 and <=10000?k.Value.Samples:k.Value.Sources.Length));
-        // Prefer recent measured samples; use last known state quote when offline.
+    private static readonly Dictionary<string,string> StateNames = ("AL:Alabama|AK:Alaska|AZ:Arizona|AR:Arkansas|CA:California|CO:Colorado|CT:Connecticut|DE:Delaware|DC:District of Columbia|FL:Florida|GA:Georgia|HI:Hawaii|ID:Idaho|IL:Illinois|IN:Indiana|IA:Iowa|KS:Kansas|KY:Kentucky|LA:Louisiana|ME:Maine|MD:Maryland|MA:Massachusetts|MI:Michigan|MN:Minnesota|MS:Mississippi|MO:Missouri|MT:Montana|NE:Nebraska|NV:Nevada|NH:New Hampshire|NJ:New Jersey|NM:New Mexico|NY:New York|NC:North Carolina|ND:North Dakota|OH:Ohio|OK:Oklahoma|OR:Oregon|PA:Pennsylvania|RI:Rhode Island|SC:South Carolina|SD:South Dakota|TN:Tennessee|TX:Texas|UT:Utah|VT:Vermont|VA:Virginia|WA:Washington|WV:West Virginia|WI:Wisconsin|WY:Wyoming").Split('|').Select(x=>x.Split(':')).ToDictionary(x=>x[0],x=>RealFuelPrices.Key(x[1]));
+    internal static RealFuelPrices.Feed? VerifiedDiesel(string root,DateTime now) {
+        var cfg=CentralPriceFeed.Configuration;
+        return cfg==null?null:CentralPriceFeed.ReadVerified(Path.Combine(root,CentralPriceFeed.CacheName),cfg.PublicKeyPem,now)?.Ats;
+    }
+    internal static Dictionary<string,Price> Compute(Dictionary<string,Observation> observations,DateTime now,RealFuelPrices.Feed? diesel=null) {
+        var direct=observations.Where(k=>Neighbours.ContainsKey(k.Key)&&k.Value!=null&&Valid(k.Value.UsdPerGallon)&&k.Value.Checked<=now.AddMinutes(5)&&k.Value.Checked>=now.AddDays(-30)&&k.Value.Sources is {Length:>0 and <=3}).ToDictionary(k=>k.Key,k=>new Price(k.Value.UsdPerGallon,k.Value.Checked>=now.AddDays(-7)?"public":"cached",k.Value.Samples is >0 and <=10000?k.Value.Samples:k.Value.Sources.Length));
         var fresh=direct.Where(k=>k.Value.Kind=="public").ToDictionary(k=>k.Key,k=>k.Value);var basis=fresh.Count>0?fresh:direct;
-        var national=basis.Count>0?new Price(basis.Values.Average(p=>p.UsdPerGallon),"national",basis.Values.Sum(p=>p.Samples)):new Price(.8m*LitresPerGallon,"test",0);
-        var result=new Dictionary<string,Price>(direct){["USA"]=national};
-        foreach(var (state,adjacent) in Neighbours) {
+        // EIA prices are USD/l; they are a proxy for regional distribution costs, NEVER DEF measurements.
+        var proxy=new Dictionary<string,decimal>();
+        if(diesel!=null)foreach(var (state,key) in StateNames){
+            if(diesel.Sources?.GetValueOrDefault(key)!=RealFuelPrices.EiaSource||diesel.DateFor(key)<now.Date.AddDays(-30)||diesel.DateFor(key)>now.Date.AddDays(1))continue;
+            if(diesel.Prices.TryGetValue(key,out var fuel)&&fuel.Diesel is decimal p&&p*LitresPerGallon is >=1m and <=12m)proxy[state]=p*LitresPerGallon;
+        }
+        decimal center=proxy.Count>0?proxy.Values.Average():4m;
+        // Explicit simulation assumption: $3.50/gal at $4 diesel, 20% absolute pass-through.
+        decimal reference=basis.Count>0?basis.Values.Average(p=>p.UsdPerGallon):3.50m+.20m*(center-4m);
+        var result=new Dictionary<string,Price>(direct){["USA"]=new(Math.Clamp(reference,.5m,15m),"index",0)};
+        foreach(var state in Neighbours.Keys){
             if(result.ContainsKey(state))continue;
-            var nearby=adjacent.Split(' ',StringSplitOptions.RemoveEmptyEntries).Where(basis.ContainsKey).Select(s=>basis[s]).ToArray();
-            result[state]=nearby.Length>0?new Price(nearby.Average(p=>p.UsdPerGallon),"neighbours",nearby.Sum(p=>p.Samples)):national;
+            decimal offset=proxy.TryGetValue(state,out var local)?Math.Clamp(.25m*(local-center),-.75m,.75m):0m;
+            result[state]=new(Math.Round(Math.Clamp(reference+offset,.5m,15m),4),"index",0);
         }
         return result;
     }
-    internal static string Bridge(Price p,string state,long timestamp)=>$"RCDEF1 {timestamp} {(p.UsdPerGallon/LitresPerGallon).ToString("0.000000",Inv)} {state} {p.Kind}\n";
+    internal static string Bridge(Price p,string state,long timestamp)=>$"RCDEF1 {timestamp} {(p.UsdPerGallon/LitresPerGallon).ToString("0.000000",Inv)} {state} {(p.Kind=="index"?"national":p.Kind)}\n";
     internal static DateTime NextRefresh(RefreshAttempt? attempt, DateTime now) =>
         attempt != null && attempt.StartedUtc >= now - RefreshInterval && attempt.StartedUtc <= now.AddMinutes(5)
             ? attempt.StartedUtc + RefreshInterval : now;
@@ -132,9 +144,7 @@ internal static class DefRealPrices
         var live = Path.Combine(dir, "def-live.txt");
         var fallback = Path.Combine(dir, "def-fallback.txt");
         var cache = Path.Combine(dir, "def-quotes.json");
-        var attemptPath = Path.Combine(dir, "def-refresh-central-v1.json");
         var disabled = Path.Combine(root, "disabled.txt");
-        var nextUpdate = NextRefresh(AdBlueRealPrices.Load<RefreshAttempt>(attemptPath), DateTime.UtcNow);
         var nextLookup = DateTime.MinValue;
         var nextInstallCheck = DateTime.MinValue;
         var nextPublish = DateTime.MinValue;
@@ -142,8 +152,6 @@ internal static class DefRealPrices
         double lastX = double.NaN, lastZ = double.NaN;
         string? state = null;
         string? lastPublished = null;
-        Task? refresh = null;
-        CancellationTokenSource? refreshScope = null;
         Dictionary<string, Price> prices = new();
 
         try
@@ -154,16 +162,6 @@ internal static class DefRealPrices
                 try
                 {
                     var now = DateTime.UtcNow;
-                    if (refresh?.IsCompleted == true)
-                    {
-                        var completed = refresh;
-                        refresh = null;
-                        nextPublish = DateTime.MinValue;
-                        try { await completed; }
-                        catch (OperationCanceledException) when (refreshScope?.IsCancellationRequested == true) { }
-                        finally { refreshScope?.Dispose(); refreshScope = null; }
-                    }
-
                     var sample = reader.Read("ATS");
                     bool running = IsAts(sample);
                     if (!running) nextInstallCheck = DateTime.MinValue;
@@ -175,8 +173,6 @@ internal static class DefRealPrices
                     }
 
                     bool disabledNow = File.Exists(disabled);
-                    bool offline = PublicDataHttp.Offline(root);
-                    if (disabledNow || offline) refreshScope?.Cancel();
                     if (!running || !installed || disabledNow)
                     {
                         Delete(live);
@@ -185,17 +181,6 @@ internal static class DefRealPrices
                         lastX = lastZ = double.NaN;
                         nextPublish = DateTime.MinValue;
                         continue;
-                    }
-
-                    if (refresh == null && now >= nextUpdate && !offline)
-                    {
-                        // Commit the attempt before contacting the provider. A restart after a failed
-                        // or rate-limited sweep keeps the same daily limit.
-                        nextUpdate = now.AddMinutes(1);
-                        AdBlueRealPrices.Atomic(attemptPath, JsonSerializer.Serialize(new RefreshAttempt(now)));
-                        nextUpdate = now + RefreshInterval;
-                        refreshScope = CancellationTokenSource.CreateLinkedTokenSource(ct);
-                        refresh = Refresh(root, cache, refreshScope.Token);
                     }
 
                     if (sample.SpeedKmh is not double speed || !double.IsFinite(speed) || Math.Abs(speed) > 1 ||
@@ -225,7 +210,7 @@ internal static class DefRealPrices
                     long stamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
                     if (now >= nextPublish)
                     {
-                        prices = Compute(AdBlueRealPrices.Load<Dictionary<string,Observation>>(cache) ?? new(), DateTime.UtcNow);
+                        prices = Compute(AdBlueRealPrices.Load<Dictionary<string,Observation>>(cache) ?? new(), now, VerifiedDiesel(root,now));
                         AdBlueRealPrices.Atomic(fallback, Bridge(prices["USA"], "USA", stamp));
                         var snapshot = JsonSerializer.Serialize(prices);
                         if (snapshot != lastPublished)
@@ -248,8 +233,6 @@ internal static class DefRealPrices
         finally
         {
             Delete(live);
-            if (refresh != null) try { await refresh; } catch { }
-            refreshScope?.Dispose();
         }
     }
 

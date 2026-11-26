@@ -71,7 +71,7 @@ internal static class CentralPriceFeed
             if(q==null||!AdBlueRealPrices.Neighbours.ContainsKey(q.Country)||q.Local<=0||q.Local>5000||
                 q.Checked>reference.AddMinutes(5)||q.Checked<reference.AddDays(-30)||q.Currency==null||!Regex.IsMatch(q.Currency,"^[A-Z]{3}$")||
                 (q.Published is DateTime d&&(d.Date>q.Checked.Date.AddDays(1)||d.Date<q.Checked.Date.AddDays(-14)))||
-                !((q.Country=="E"&&q.Currency=="EUR"&&q.Source==AdBlueRealPrices.SpainUrl)||AdBlueRealPrices.Sources.Any(s=>s.Country==q.Country&&s.Currency==q.Currency&&s.Url==q.Source))||
+                !(AdBlueRealPrices.ApprovedQuote(q)||AdBlueRealPrices.VatQuote(q)||AdBlueRealPrices.Sources.Any(s=>s.Country==q.Country&&s.Currency==q.Currency&&s.Url==q.Source))||
                 !sourceKeys.Add((q.Country,q.Source)))throw new InvalidDataException("Invalid AdBlue observation.");
         }
         foreach(var (state,q) in p.Def) {
@@ -87,30 +87,51 @@ internal static class CentralPriceFeed
     {
         try { if(new FileInfo(path).Length>MaxBytes)return null;return Verify(File.ReadAllText(path),key,now,allowExpired); }catch{return null;}
     }
-    internal static async Task<Payload?> GetAsync(string root,CancellationToken ct)
+    internal static readonly TimeSpan RefreshInterval = TimeSpan.FromHours(24);
+    internal static readonly TimeSpan RetryInterval = TimeSpan.FromMinutes(15);
+    internal static readonly TimeSpan ManualCooldown = TimeSpan.FromMinutes(1);
+    internal sealed record RefreshState(DateTime AttemptUtc, DateTime? SuccessUtc);
+    internal static bool CanRefresh(RefreshState? state, DateTime now, bool force, bool hasCache)
+    {
+        if(state==null)return true;
+        bool Valid(DateTime time)=>time!=DateTime.MinValue&&time<=now;
+        if(force)return !Valid(state.AttemptUtc)||now-state.AttemptUtc>=ManualCooldown;
+        if(Valid(state.AttemptUtc)&&now-state.AttemptUtc<RetryInterval)return false;
+        return !hasCache||state.SuccessUtc is not DateTime success||!Valid(success)||state.AttemptUtc>success||now-success>=RefreshInterval;
+    }
+    internal static async Task<Payload?> GetAsync(string root,CancellationToken ct,bool force=false)
     {
         var config=Configuration;
-        if(config==null)return null; // fail closed until the owner configures the publication URL and key
+        if(config==null) { if(force)throw new InvalidOperationException("Central feed not configured.");return null; }
         await Gate.WaitAsync(ct);
         try {
             var now=DateTime.UtcNow;var cache=Path.Combine(root,CacheName);
             var old=ReadVerified(cache,config.PublicKeyPem,now,true);
             var usable=old!=null&&old.GeneratedUtc>=now.AddDays(-30)?old:null;
-            if(PublicDataHttp.Offline(root))return usable;
-            var attempt=Path.Combine(root,"central-attempt.json");
-            if(DefRealPrices.NextRefresh(AdBlueRealPrices.Load<DefRealPrices.RefreshAttempt>(attempt),now)>now)return usable;
-            AdBlueRealPrices.Atomic(attempt,JsonSerializer.Serialize(new DefRealPrices.RefreshAttempt(now)));
+            if(PublicDataHttp.Offline(root)) { if(force)throw new InvalidOperationException("Public downloads disabled (offline mode).");return usable; }
+            var statePath=Path.Combine(root,"central-refresh-v2.json");
+            var state=AdBlueRealPrices.Load<RefreshState>(statePath);
+            if(!CanRefresh(state,now,force,usable!=null)) {
+                if(force)throw new InvalidOperationException("Manual refresh cooldown: try again in one minute.");
+                return usable;
+            }
+            AdBlueRealPrices.Atomic(statePath,JsonSerializer.Serialize(new RefreshState(now,state?.SuccessUtc)));
             try {
                 using var http=PublicDataHttp.Create(root,20,MaxBytes,Endpoint(config.Url));
                 var text=await http.GetStringAsync(config.Url,ct);
                 var current=Verify(text,config.PublicKeyPem,DateTime.UtcNow);
-                if(current.GeneratedUtc<now.AddDays(-3)||old!=null&&current.GeneratedUtc<old.GeneratedUtc)
+                if(current.GeneratedUtc<now.AddDays(-14)||old!=null&&current.GeneratedUtc<old.GeneratedUtc)
                     throw new InvalidDataException("Stale or rolled-back central feed.");
-                if(PublicDataHttp.Offline(root))return usable;
+                if(PublicDataHttp.Offline(root)) {if(force)throw new InvalidOperationException("Public downloads disabled (offline mode).");return usable;}
                 AdBlueRealPrices.Atomic(cache,text);
+                AdBlueRealPrices.Atomic(statePath,JsonSerializer.Serialize(new RefreshState(now,DateTime.UtcNow)));
                 Log(root,"Verified central feed: "+current.GeneratedUtc.ToString("O"));
                 return current;
-            } catch(Exception ex) when(!ct.IsCancellationRequested) { Log(root,"Central feed unavailable: "+ex.Message);return usable; }
+            } catch(Exception ex) when(!ct.IsCancellationRequested) {
+                Log(root,"Central feed unavailable: "+ex.GetType().Name+": "+ex.Message+(ex.InnerException==null?"":" | "+ex.InnerException.GetType().Name+": "+ex.InnerException.Message));
+                if(force)throw;
+                return usable;
+            }
         } finally { Gate.Release(); }
     }
     private static void Log(string root,string s)=>RoadChronBoundedFileAppender.AppendLine(Path.Combine(root,"central-prices.log"),$"[{DateTime.UtcNow:O}] {s}");

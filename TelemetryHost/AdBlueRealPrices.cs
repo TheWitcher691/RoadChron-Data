@@ -31,6 +31,33 @@ internal static class AdBlueRealPrices
         new("A", "EUR", "https://www.avia-moser.at/autopflege/tankstellenfinder-avia-wash-49686.html", @"\bAdBlue\s*:\s*€\s*(\d{1,3}[,.]\d{2,3})")
     ];
     internal const string SpainUrl = "https://sedeaplicaciones.minetur.gob.es/ServiciosRESTCarburantes/PreciosCarburantes/EstacionesTerrestres/";
+    internal const string RomaniaUrl = "https://pretcarburant.ro/api/v1/statii?tip=adblue";
+    // Optional catalogue prices: enable network collection only after written permission.
+    internal static readonly (string Country,string Currency,string Url)[] VatSources = [
+        ("LV","EUR","https://vatservice.eu/getprice/get_price_lv_AdB.php"),
+        ("LT","EUR","https://vatservice.eu/getprice/get_price_lt_AdB.php"),
+        ("DK","DKK","https://vatservice.eu/getprice/get_price_dk_AdB.php"),
+        ("L","EUR","https://vatservice.eu/getprice/get_price_lux_AdB.php"),
+        ("B","EUR","https://vatservice.eu/getprice/get_price_be_AdB.php"),
+        ("S","SEK","https://vatservice.eu/getprice/get_price_se_AdB.php")
+    ];
+    internal static bool VatEnabled => Environment.GetEnvironmentVariable("ROADCHRON_VATSERVICE_APPROVED")=="true";
+    internal static bool VatQuote(Quote q) => VatSources.Any(s=>s.Country==q.Country&&s.Currency==q.Currency&&s.Url==q.Source);
+    internal static Quote? ParseVat(string text,(string Country,string Currency,string Url) source,Fx? fx,DateTime now) {
+        if(text.Length>4096)return null;
+        // A bare text response or simple presentation-only wrapper is accepted; never execute markup.
+        var value=System.Net.WebUtility.HtmlDecode(Regex.Replace(text,@"</?(?:html|body|div|span|p|b|strong)\s*>"," ",RegexOptions.IgnoreCase,TimeSpan.FromSeconds(1))).Trim();
+        var match=Regex.Match(value,@"\A([0-9]{1,3}[,.][0-9]{1,4})\s+([A-Z]{3})\z",RegexOptions.CultureInvariant,TimeSpan.FromSeconds(1));
+        if(!match.Success||match.Groups[2].Value!=source.Currency||ParseLocal(match.Groups[1].Value) is not decimal local)return null;
+        decimal rate=1m;
+        if(source.Currency!="EUR"&&(fx==null||!fx.Rates.TryGetValue(source.Currency,out rate)||rate<=0))return null;
+        if(local/rate is <.05m or >5m)return null;
+        return new(source.Country,source.Currency,local,now,source.Url);
+    }
+    // Data provenance is separate from the network allowlist. Only these feeds are approved for publication.
+    internal static bool ApprovedQuote(Quote q) =>
+        (q.Country=="E" && q.Currency=="EUR" && q.Source==SpainUrl) ||
+        (q.Country=="RO" && q.Currency=="RON" && q.Source==RomaniaUrl);
     // Tachograph country codes, land neighbours. No recursive estimates are used as observations.
     internal static readonly Dictionary<string,string> Neighbours = new(StringComparer.OrdinalIgnoreCase) {
         ["RKS"]="AL MNE SRB MK",
@@ -66,7 +93,9 @@ internal static class AdBlueRealPrices
         try {
             var path=Path.Combine(root,FxCacheName); var cached=Load<Fx>(path); var now=DateTime.UtcNow;
             bool valid=ValidFx(cached,now);
+            #if ROADCHRON_COLLECTOR
             if(valid && now-cached!.Fetched<TimeSpan.FromHours(24))return cached;
+#endif
             if (PublicDataHttp.Offline(root)) return valid?cached:null;
 #if ROADCHRON_COLLECTOR
             var attemptPath=Path.Combine(root,"ecb-attempt.json");
@@ -112,38 +141,69 @@ internal static class AdBlueRealPrices
         }
         return prices.Count>=10?prices.Average():null;
     }
+    // PretCarburant public station sample, CC BY 4.0. Reject ambiguous, undated or stale observations.
+    internal static Quote? ParseRomania(string json, DateTime now)
+    {
+        using var doc=JsonDocument.Parse(json);var root=doc.RootElement;
+        if(root.ValueKind!=JsonValueKind.Object||Text(root,"status")!="ok"||
+           !root.TryGetProperty("statii",out var rows)||rows.ValueKind!=JsonValueKind.Array||rows.GetArrayLength()>150)return null;
+        var stations=new Dictionary<string,(decimal Price,DateTime Date)>(StringComparer.Ordinal);
+        var conflicts=new HashSet<string>(StringComparer.Ordinal);
+        foreach(var row in rows.EnumerateArray()){
+            if(row.ValueKind!=JsonValueKind.Object||Text(row,"tip")!="adblue"||
+               Flag(row,"pret_expirat")||Flag(row,"nesigur")||Flag(row,"pret_incoerent"))continue;
+            var id=Text(row,"id");var observed=Text(row,"observat_la");
+            if(string.IsNullOrWhiteSpace(id)||id.Length>160||string.IsNullOrEmpty(observed)||
+               !DateTimeOffset.TryParse(observed,Inv,DateTimeStyles.AssumeUniversal,out var stamp)||
+               stamp.UtcDateTime.Date<now.Date.AddDays(-7)||stamp.UtcDateTime>now.AddDays(1)||
+               !row.TryGetProperty("pret",out var value)||value.ValueKind!=JsonValueKind.Number||
+               !value.TryGetDecimal(out var price)||price<.25m||price>25m)continue;
+            if(stations.TryGetValue(id,out var old)&&old.Price!=price){conflicts.Add(id);continue;}
+            if(!stations.TryGetValue(id,out old)||stamp.UtcDateTime>old.Date)stations[id]=(price,stamp.UtcDateTime);
+        }
+        foreach(var id in conflicts)stations.Remove(id);
+        if(stations.Count<3)return null;
+        return new("RO","RON",stations.Values.Average(v=>v.Price),now,RomaniaUrl,stations.Values.Min(v=>v.Date));
+        static string? Text(JsonElement e,string key)=>e.TryGetProperty(key,out var v)&&v.ValueKind==JsonValueKind.String?v.GetString():null;
+        static bool Flag(JsonElement e,string key)=>e.TryGetProperty(key,out var v)&&v.ValueKind!=JsonValueKind.False&&v.ValueKind!=JsonValueKind.Null;
+    }
     internal static Dictionary<string,CountryPrice> Compute(IEnumerable<Quote> quotes, Fx? fx, DateTime now)
     {
-        var observations=quotes.Where(q=>q is { Country: not null, Currency: not null }&&q.Local>0&&q.Local<=5000&&q.Checked<=now.AddMinutes(5)&&q.Checked>=now.AddDays(-7)&&(!q.Published.HasValue||q.Published.Value.Date>=now.Date.AddDays(-14))&&Neighbours.ContainsKey(q.Country)).GroupBy(q=>q.Country).Select(g=>new {Country=g.Key, Prices=g.Select(q=> {
+        var observations=quotes.Where(q=>q is { Country: not null, Currency: not null }&&q.Local>0&&q.Local<=5000&&q.Checked<=now.AddMinutes(5)&&q.Checked>=now.AddDays(-30)&&(!q.Published.HasValue||q.Published.Value.Date>=now.Date.AddDays(-30))&&Neighbours.ContainsKey(q.Country)).GroupBy(q=>q.Country).Select(g=>new {Country=g.Key, Prices=g.Select(q=> {
             decimal rate=1; if(q.Currency!="EUR"&&(fx==null||!fx.Rates.TryGetValue(q.Currency,out rate)||rate<=0))return (Price:0m,Quote:q);
             var eur=q.Local/rate;return (Price:eur>=.05m&&eur<=5m?eur:0m,Quote:q);
         }).Where(p=>p.Price>0).ToArray()}).Where(g=>g.Prices.Length>0).ToDictionary(g=>g.Country,g=>{
-            var fresh=g.Prices.Where(p=>p.Quote.Checked>=now.AddHours(-24)&&(!p.Quote.Published.HasValue||p.Quote.Published.Value.Date>=now.Date.AddDays(-1))).ToArray();
-            var used=fresh.Length>0?fresh:g.Prices;
-            return new CountryPrice(used.Average(p=>p.Price),fresh.Length>0?"public":"cached",string.Join("; ",used.Select(p=>p.Quote.Source)));
+            var fresh=g.Prices.Where(p=>p.Quote.Checked>=now.AddDays(ApprovedQuote(p.Quote)||VatQuote(p.Quote)?-7:-1)&&(!p.Quote.Published.HasValue||p.Quote.Published.Value.Date>=now.Date.AddDays(ApprovedQuote(p.Quote)||VatQuote(p.Quote)?-7:-1))).ToArray();
+            // A station sample takes precedence over a catalogue price.
+            var measured=fresh.Where(p=>!VatQuote(p.Quote)).ToArray();
+            var used=measured.Length>0?measured:fresh.Length>0?fresh:g.Prices;
+            var kind=fresh.Length==0?"cached":used.All(p=>VatQuote(p.Quote))?"catalogue":"public";
+            return new CountryPrice(used.Average(p=>p.Price),kind,string.Join("; ",used.Select(p=>p.Quote.Source)));
         },StringComparer.OrdinalIgnoreCase);
         var result=new Dictionary<string,CountryPrice>(observations,StringComparer.OrdinalIgnoreCase);
-        var average=observations.Count>0?new CountryPrice(observations.Values.Average(p=>p.Eur),"europe","available countries: "+string.Join(",",observations.Keys)):new CountryPrice(2m/4.45m,"test","no public data; 0.9.1 fallback");
-        result["EU"]=average;
-        foreach(var (country,adjacent) in Neighbours) {
-            if(result.ContainsKey(country))continue;
-            var nearby=adjacent.Split(' ',StringSplitOptions.RemoveEmptyEntries).Where(observations.ContainsKey).Distinct().ToArray();
-            result[country]=nearby.Length>0?new(nearby.Average(n=>observations[n].Eur),"neighbours",string.Join(",",nearby)):average;
-        }
+        // Gross-price scenario factors, NOT observed national price ratios or VAT rates.
+        // Recalibrate when adequate legal measurements become available.
+        var recent=observations.Where(p=>p.Value.Kind is "public" or "catalogue").ToArray();
+        var basis=recent.Length>0?recent:observations.ToArray();
+        var normalized=basis.Select(p=>p.Value.Eur/IndexFactor(p.Key)).OrderBy(x=>x).ToArray();
+        decimal reference=normalized.Length==0?.95m:normalized.Length%2==1?normalized[normalized.Length/2]:(normalized[normalized.Length/2-1]+normalized[normalized.Length/2])/2m;
+        string detail=normalized.Length==0?"RoadChron scenario baseline (no measurements)":"RoadChron median normalized anchors: "+string.Join(",",basis.Select(p=>p.Key).Order());
+        result["EU"]=new(Math.Clamp(reference,.05m,5m),"index",detail);
+        foreach(var country in Neighbours.Keys)
+            if(!result.ContainsKey(country))result[country]=new(Math.Round(Math.Clamp(reference*IndexFactor(country),.05m,5m),4),"index",detail);
         return result;
     }
+    internal static decimal IndexFactor(string country)=>country switch {
+        "PL" or "RO" or "BG" or "MD" or "UA" or "AL" or "MK" or "RKS" or "BIH" or "SRB" or "BY" => .85m,
+        "CZ" or "SK" or "H" or "LT" or "LV" or "EST" or "TR" or "MNE" or "RUS" => .95m,
+        "DK" or "N" or "S" or "FIN" or "IS" or "FO" or "CH" or "FL" => 1.30m,
+        "D" or "F" or "A" or "B" or "NL" or "L" or "UK" or "IRL" or "I" or "MC" or "V" or "RSM" => 1.15m,
+        _=>1m
+    };
     internal static T? Load<T>(string path) where T:class {try{if(new FileInfo(path).Length>4*1024*1024)return null;return JsonSerializer.Deserialize<T>(File.ReadAllText(path));}catch{return null;}}
     internal static Dictionary<string,CountryPrice> PricesFromCache(IEnumerable<Quote> quotes,Fx? fx,DateTime now)
     {
-        var rows=quotes.Where(q=>q!=null).ToArray();
-        var prices=Compute(rows,fx,now);
-        if(prices["EU"].Kind!="test")return prices;
-        var older=rows.Where(q=>q.Checked>=now.AddDays(-30)&&q.Checked<=now).ToArray();
-        if(older.Length==0)return prices;
-        // Value conversion and regional weighting use the last observed day.
-        // Keep estimated regional prices distinguishable during an offline month.
-        var historical=Compute(older,fx,older.Max(q=>q.Checked));
-        return historical.ToDictionary(p=>p.Key,p=>p.Value.Kind=="public"?p.Value with {Kind="cached"}:p.Value);
+        return Compute(quotes,fx,now);
     }
     internal static Dictionary<string,CountryPrice> LoadRegionalPrices(string snapshot,List<Quote> quotes,Fx? fx,DateTime now,out bool legacy)
     {
@@ -156,7 +216,7 @@ internal static class AdBlueRealPrices
         if(old?.TryGetValue("EU",out var fallback)!=true||fallback is not {Eur: >=.05m and <=5m,Kind:"europe" or "offline"})return prices;
         foreach(var (key,p) in old){
             if(!prices.ContainsKey(key)||p is not {Eur: >=.05m and <=5m})continue;
-            if(p.Kind is "public" or "cached")prices[key]=p with {Kind="cached"};
+            if(p.Kind is "public" or "cached" or "catalogue")prices[key]=p with {Kind="cached"};
             else if(p.Kind is "neighbours" or "europe" or "offline")prices[key]=p;
         }
         legacy=true; return prices;
@@ -164,7 +224,7 @@ internal static class AdBlueRealPrices
     internal static void Atomic(string path,string data) {Directory.CreateDirectory(Path.GetDirectoryName(path)!);string tmp=path+"."+Guid.NewGuid().ToString("N")+".tmp";try{File.WriteAllText(tmp,data,new UTF8Encoding(false));File.Move(tmp,path,true);}finally{if(File.Exists(tmp))File.Delete(tmp);}}
     private static void Save<T>(string path,T data)=>Atomic(path,JsonSerializer.Serialize(data));
     private static void Log(string root,string message)=>RoadChronBoundedFileAppender.AppendLine(Path.Combine(root,"adblue-prices.log"),$"[{DateTime.UtcNow:O}] {message}");
-    private static string Bridge(CountryPrice p,string code)=>$"RCADBLUE1 {DateTimeOffset.UtcNow.ToUnixTimeSeconds()} {p.Eur.ToString("0.000000",Inv)} {code} {p.Kind}\n";
+    private static string Bridge(CountryPrice p,string code)=>$"RCADBLUE1 {DateTimeOffset.UtcNow.ToUnixTimeSeconds()} {p.Eur.ToString("0.000000",Inv)} {code} {(p.Kind=="index"?"europe":p.Kind=="catalogue"?"public":p.Kind)}\n";
     // Match the tachograph: a recognised local SCS node is a country suggestion.
     // Ambiguous or absent data use the explicitly labelled EU fallback.
     internal static string? SelectCountry(bool detected, string? code)
@@ -176,23 +236,26 @@ internal static class AdBlueRealPrices
     {
         var root=Path.Combine(dataRoot,"fuel-prices");var dir=Path.Combine(root,"ETS2");var livePath=Path.Combine(dir,"adblue-live.txt");var fallback=Path.Combine(dir,"adblue-fallback.txt");
         var mod=Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),"Euro Truck Simulator 2","mod",RealFuelPrices.ModName);
-        using var http=PublicDataHttp.Create(root,20,24*1024*1024);
         var quotesPath=Path.Combine(dir,"adblue-quotes.json"); var quotes=Load<List<Quote>>(quotesPath)??[]; var fx=Load<Fx>(Path.Combine(root,FxCacheName));
         if(!ValidFx(fx,DateTime.UtcNow))fx=null;
         var snapshot=Path.Combine(dir,"adblue-countries.json");
         var prices=LoadRegionalPrices(snapshot,quotes,fx,DateTime.UtcNow,out _);
         var nextEvaluation=DateTime.MinValue;
-        var attemptPath=Path.Combine(dir,"adblue-attempt-central-v1.json");
-        DateTime nextUpdate=DefRealPrices.NextRefresh(Load<DefRealPrices.RefreshAttempt>(attemptPath),DateTime.UtcNow),nextLookup=DateTime.MinValue; string? country=null; double lastX=double.NaN,lastZ=double.NaN;
-        Task<(List<Quote>,Fx?)>? refresh=null;
+        DateTime nextLookup=DateTime.MinValue, nextCacheRead=DateTime.MinValue; string? country=null; double lastX=double.NaN,lastZ=double.NaN;
+        var fxPath=Path.Combine(root,FxCacheName);
+        DateTime lastQuoteWrite=DateTime.MinValue,lastFxWrite=DateTime.MinValue;
         try {
             while(!ct.IsCancellationRequested){
                 try {
                     if(!File.Exists(mod)||File.Exists(Path.Combine(root,"disabled.txt"))){country=null;if(File.Exists(livePath))File.Delete(livePath);await Task.Delay(5000,ct);continue;}
                     var now=DateTime.UtcNow;
-                    if(refresh==null&&now>=nextUpdate&&!PublicDataHttp.Offline(root)){Save(attemptPath,new DefRealPrices.RefreshAttempt(now));nextUpdate=now.AddHours(24);refresh=RefreshAsync(root,dir,quotes,fx,http,ct);}
-                    if(refresh?.IsCompleted==true){
-                        try{(quotes,fx)=await refresh;nextEvaluation=DateTime.MinValue;}finally{refresh=null;}
+                    if(now>=nextCacheRead){
+                        nextCacheRead=now.AddSeconds(5);
+                        var quoteWrite=File.GetLastWriteTimeUtc(quotesPath);var fxWrite=File.GetLastWriteTimeUtc(fxPath);
+                        if(quoteWrite!=lastQuoteWrite||fxWrite!=lastFxWrite){
+                            quotes=Load<List<Quote>>(quotesPath)??quotes;fx=Load<Fx>(fxPath)??fx;
+                            lastQuoteWrite=quoteWrite;lastFxWrite=fxWrite;nextEvaluation=DateTime.MinValue;
+                        }
                     }
                     if(now>=nextEvaluation){
                         prices=LoadRegionalPrices(snapshot,quotes,ValidFx(fx,now)?fx:null,now,out var legacy);
@@ -223,7 +286,7 @@ internal static class AdBlueRealPrices
                 }catch(Exception ex) when(!ct.IsCancellationRequested){Log(root,"AdBlue bridge: "+ex.Message);try{File.Delete(livePath);}catch{}}
                 await Task.Delay(2000,ct);
             }
-        }catch(OperationCanceledException) when(ct.IsCancellationRequested){}finally{try{File.Delete(livePath);}catch{}if(refresh!=null)try{await refresh;}catch{}}
+        }catch(OperationCanceledException) when(ct.IsCancellationRequested){}finally{try{File.Delete(livePath);}catch{}}
     }
     private static int _refreshActive;
     private static int _refreshProgress;

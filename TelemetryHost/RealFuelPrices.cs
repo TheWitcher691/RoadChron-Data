@@ -14,6 +14,9 @@ internal static class RealFuelPrices
     internal const string AtsSource = "https://gasprices.aaa.com/todays-state-averages/";
     internal const string EtsSource = "https://www.euenergyprices.eu/en/fuel";
     internal const string AmzsSource = "https://www.amzs.si/na-poti/cene-goriv-po-evropi";
+    internal const string UkSource = "https://www.gov.uk/government/statistics/weekly-road-fuel-prices";
+    internal const string NorwaySource = "https://www.ssb.no/en/statbank/table/09654";
+    internal const string NorwayData = "https://data.ssb.no/api/pxwebapi/v2/tables/09654/data?lang=en&valueCodes%5BPetroleumProd%5D=031,035&valueCodes%5BTid%5D=top(1)&valueCodes%5BContentsCode%5D=Priser&outputFormat=json-stat2";
     internal const string EiaSource = "https://www.eia.gov/dnav/pet/pet_pri_gnd_a_epmr_pte_dpgal_w.htm";
     internal static readonly string[] EiaPages = [EiaSource,
         "https://www.eia.gov/dnav/pet/pet_pri_gnd_a_epd2d_pte_dpgal_w.htm",

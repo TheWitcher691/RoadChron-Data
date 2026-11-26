@@ -2,7 +2,7 @@ name: RoadChron price dataset
 on:
   workflow_dispatch:
   schedule:
-    - cron: '17 4 * * *'
+    - cron: '17 4 * * 5'
 permissions:
   contents: read
 concurrency:
@@ -28,7 +28,9 @@ jobs:
         run: dotnet run --no-build -c Release --project tools/central-data/Collector.csproj -- selftest
       - name: Collect and sign approved sources
         env:
+          ROADCHRON_VATSERVICE_APPROVED: ${{ vars.ROADCHRON_VATSERVICE_APPROVED }}
           ROADCHRON_PRICE_SIGNING_KEY: ${{ secrets.ROADCHRON_PRICE_SIGNING_KEY }}
+          ROADCHRON_ROMANIA_SCHEDULED: ${{ github.event_name == 'schedule' && github.run_attempt == 1 && 'true' || 'false' }}
         run: dotnet run --no-build -c Release --project tools/central-data/Collector.csproj -- collect TelemetryHost/CentralPriceFeedConfig.json public/fuel-prices.json
       - uses: actions/upload-pages-artifact@v3
         with:
