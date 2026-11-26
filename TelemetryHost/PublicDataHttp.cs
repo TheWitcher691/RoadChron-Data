@@ -29,6 +29,7 @@ internal static class PublicDataHttp
         Timeout = TimeSpan.FromSeconds(seconds), MaxResponseContentBufferSize = maxBytes };
     private static readonly HashSet<string> Feeds = new(
         new[] { AdBlueRealPrices.FxUrl, AdBlueRealPrices.SpainUrl, RealFuelPrices.AtsSource, RealFuelPrices.EtsSource, RealFuelPrices.AmzsSource, DefRealPrices.PilotSource }
+            .Concat(RealFuelPrices.EiaPages)
             .Concat(AdBlueRealPrices.Sources.Select(source => source.Url))
             .Concat(RealFuelPrices.EuropeanCountryCodes.Values.Select(country => RealFuelPrices.EtsSource + "/" + country))
             .Select(url => new Uri(url).AbsoluteUri), StringComparer.Ordinal);
@@ -45,6 +46,11 @@ internal static class PublicDataHttp
         var match = DefCatalogPath.Match(uri.AbsolutePath);
         return match.Success && DefRealPrices.Neighbours.ContainsKey(match.Groups["state"].Value.ToUpperInvariant());
     }
+    // Publisher policy is intentionally narrower than legacy provenance validation.
+    internal static bool CollectorAllowed(Uri? uri) => Allowed(uri) && uri != null &&
+        (uri.AbsoluteUri == AdBlueRealPrices.FxUrl || uri.AbsoluteUri == AdBlueRealPrices.SpainUrl ||
+         RealFuelPrices.EiaPages.Contains(uri.AbsoluteUri, StringComparer.Ordinal) ||
+         uri.AbsoluteUri == RealFuelPrices.EtsSource || RealFuelPrices.EuropeanCountryCodes.Values.Any(c=>uri.AbsoluteUri==RealFuelPrices.EtsSource+"/"+c));
     internal static bool AllowedSource(string? source) => Uri.TryCreate(source,UriKind.Absolute,out var uri)&&Allowed(uri);
     // Allowed() describes source provenance; only the collector build may contact those sources.
     internal sealed class Gate(string root, HttpMessageHandler transport, Uri? central = null) : DelegatingHandler(transport)
@@ -54,7 +60,7 @@ internal static class PublicDataHttp
             if (Offline(root)) throw new HttpRequestException("Public downloads disabled (offline mode).");
             bool allowed = central != null && CentralPriceFeed.Endpoint(central.AbsoluteUri) != null && request.RequestUri?.AbsoluteUri == central.AbsoluteUri;
 #if ROADCHRON_COLLECTOR
-            if (central == null) allowed = Allowed(request.RequestUri);
+            if (central == null) allowed = CollectorAllowed(request.RequestUri);
 #endif
             if (request.Method != HttpMethod.Get || request.Content != null || !allowed)
                 throw new HttpRequestException("Public data request blocked by privacy policy.");

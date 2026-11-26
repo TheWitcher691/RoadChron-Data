@@ -24,7 +24,9 @@ jobs:
           dotnet-version: '10.0.404'
       - name: Build collector
         run: dotnet build tools/central-data/Collector.csproj -c Release
-      - name: Collect and sign existing sources
+      - name: Test collector policy and parsing
+        run: dotnet run --no-build -c Release --project tools/central-data/Collector.csproj -- selftest
+      - name: Collect and sign approved sources
         env:
           ROADCHRON_PRICE_SIGNING_KEY: ${{ secrets.ROADCHRON_PRICE_SIGNING_KEY }}
         run: dotnet run --no-build -c Release --project tools/central-data/Collector.csproj -- collect TelemetryHost/CentralPriceFeedConfig.json public/fuel-prices.json

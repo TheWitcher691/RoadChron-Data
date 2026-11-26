@@ -14,11 +14,18 @@ internal static class RealFuelPrices
     internal const string AtsSource = "https://gasprices.aaa.com/todays-state-averages/";
     internal const string EtsSource = "https://www.euenergyprices.eu/en/fuel";
     internal const string AmzsSource = "https://www.amzs.si/na-poti/cene-goriv-po-evropi";
+    internal const string EiaSource = "https://www.eia.gov/dnav/pet/pet_pri_gnd_a_epmr_pte_dpgal_w.htm";
+    internal static readonly string[] EiaPages = [EiaSource,
+        "https://www.eia.gov/dnav/pet/pet_pri_gnd_a_epd2d_pte_dpgal_w.htm",
+        "https://www.eia.gov/dnav/pet/pet_pri_gnd_a_epmm_pte_dpgal_w.htm",
+        "https://www.eia.gov/dnav/pet/pet_pri_gnd_a_epmp_pte_dpgal_w.htm"];
+    internal static readonly string[] FuelFields = ["Petrol", "Diesel", "MidGrade", "Premium"];
     internal const decimal LitersPerUsGallon = 3.785411784m;
     internal const string ModName = "roadchron_real_fuel_prices.scs";
     internal sealed record Price(decimal? Petrol, decimal? Diesel, decimal? MidGrade = null, decimal? Premium = null);
-    internal sealed record Feed(DateTime Date, Dictionary<string, Price> Prices, Dictionary<string, DateTime>? RegionDates = null, Dictionary<string,string>? Sources = null, Dictionary<string,DateTime>? Expired = null)
+    internal sealed record Feed(DateTime Date, Dictionary<string, Price> Prices, Dictionary<string, DateTime>? RegionDates = null, Dictionary<string,string>? Sources = null, Dictionary<string,DateTime>? Expired = null, Dictionary<string,string[]>? Estimated = null)
     {
+        internal bool IsEstimated(string key, string field) => Estimated?.GetValueOrDefault(key)?.Contains(field, StringComparer.Ordinal) == true;
         internal DateTime DateFor(string key) => RegionDates?.GetValueOrDefault(key, Date) ?? Date;
     }
 
@@ -28,15 +35,18 @@ internal static class RealFuelPrices
         var prices = new Dictionary<string, Price>(current.Prices, StringComparer.Ordinal);
         var dates = current.Prices.Keys.ToDictionary(key => key, current.DateFor, StringComparer.Ordinal);
         var sources = current.Prices.Keys.ToDictionary(key => key, key => current.Sources?.GetValueOrDefault(key) ?? (ats ? AtsSource : EtsSource));
+        var estimated = current.Estimated == null ? new Dictionary<string,string[]>(StringComparer.Ordinal) : new Dictionary<string,string[]>(current.Estimated, StringComparer.Ordinal);
         foreach (var (key, price) in cached!.Prices)
         {
             var date = cached.DateFor(key);
             if (dates.TryGetValue(key, out var currentDate) && currentDate >= date) continue;
             prices[key] = price;
+            estimated.Remove(key);
+            if(cached.Estimated?.TryGetValue(key,out var flags)==true)estimated[key]=flags;
             dates[key] = date;
             sources[key] = cached.Sources?.GetValueOrDefault(key) ?? (ats ? AtsSource : EtsSource);
         }
-        return new(dates.Values.Max(), prices, dates, sources, current.Expired);
+        return new(dates.Values.Max(), prices, dates, sources, current.Expired, estimated.Count==0?null:estimated);
     }
     private static readonly Regex Row = new(@"<tr\b[^>]*>(.*?)</tr\s*>", RegexOptions.IgnoreCase | RegexOptions.Singleline);
     private static readonly Regex Cell = new(@"<t[dh]\b[^>]*>(.*?)</t[dh]\s*>", RegexOptions.IgnoreCase | RegexOptions.Singleline);
@@ -186,6 +196,9 @@ internal static class RealFuelPrices
     {
         if (feed is null || feed.Date == DateTime.MinValue || feed.Date.Date > today.Date.AddDays(1)
             || feed.Prices is null || feed.Prices.Count == 0) return false;
+        if(feed.Estimated != null && feed.Estimated.Any(row => !ats || !feed.Prices.TryGetValue(row.Key,out var p) || p==null ||
+            row.Value==null || row.Value.Length==0 || row.Value.Distinct().Count()!=row.Value.Length ||
+            row.Value.Any(f=>f switch {"Petrol"=>!p.Petrol.HasValue,"Diesel"=>!p.Diesel.HasValue,"MidGrade"=>!p.MidGrade.HasValue,"Premium"=>!p.Premium.HasValue,_=>true})))return false;
         foreach (var (key, price) in feed.Prices)
         {
             if (!(ats ? UsStates.Contains(key) : EuCodes.ContainsValue(key)) || price is null) return false;
@@ -278,7 +291,7 @@ internal static class RealFuelPrices
         Write(archive, "manifest.sii", "SiiNunit\n{\nmod_package : .package_name {\n package_version: \"0.4\"\n display_name: \"RoadChron Real Fuel Prices 0.4 AUTO\"\n author: \"RoadChron\"\n category[]: \"other\"\n description_file: \"mod_description.txt\"\n}\n}\n");
         var oldest = feed.Prices.Keys.Select(feed.DateFor).DefaultIfEmpty(feed.Date).Min();
         var dates = oldest.Date == feed.Date.Date ? DateLabel(feed.Date) : $"{DateLabel(oldest)} to {DateLabel(feed.Date)} (includes cached observations)";
-        Write(archive, "mod_description.txt", "RoadChron Real Fuel Prices 0.4 AUTO\nObservation dates: " + dates + "\n" + (ats ? "Source: AAA Fuel Prices, " + AtsSource : "Sources: AMZS " + AmzsSource + "; EU EnergyPrices " + EtsSource + " (CC BY 4.0) where used.") + "\nCountry fuel definitions, sign board prices and currency rates. Exchange rates: " + AdBlueRealPrices.FxUrl + " (where available).\n");
+        Write(archive, "mod_description.txt", "RoadChron Real Fuel Prices 0.4 AUTO\nObservation dates: " + dates + "\n" + ("Sources: " + string.Join("; ",feed.Prices.Keys.Select(k=>feed.Sources?.GetValueOrDefault(k)??(ats?AtsSource:EtsSource)).Distinct()) + (feed.Estimated?.Count>0?". Includes RoadChron regional estimates, not direct state observations.":".") + (ats?" EIA data, where used: U.S. Energy Information Administration.":" EU EnergyPrices (CC BY 4.0), EU Oil Bulletin, SSB, DESNZ, BFS where used.")) + "\nCountry fuel definitions, sign board prices and currency rates. Exchange rates: " + AdBlueRealPrices.FxUrl + " (where available).\n");
         return count;
     }
     private static readonly Dictionary<string,string> UsCodes = ("AL:Alabama|AK:Alaska|AZ:Arizona|AR:Arkansas|CA:California|CO:Colorado|CT:Connecticut|DE:Delaware|DC:District of Columbia|FL:Florida|GA:Georgia|HI:Hawaii|ID:Idaho|IL:Illinois|IN:Indiana|IA:Iowa|KS:Kansas|KY:Kentucky|LA:Louisiana|ME:Maine|MD:Maryland|MA:Massachusetts|MI:Michigan|MN:Minnesota|MS:Mississippi|MO:Missouri|MT:Montana|NE:Nebraska|NV:Nevada|NH:New Hampshire|NJ:New Jersey|NM:New Mexico|NY:New York|NC:North Carolina|ND:North Dakota|OH:Ohio|OK:Oklahoma|OR:Oregon|PA:Pennsylvania|RI:Rhode Island|SC:South Carolina|SD:South Dakota|TN:Tennessee|TX:Texas|UT:Utah|VT:Vermont|VA:Virginia|WA:Washington|WV:West Virginia|WI:Wisconsin|WY:Wyoming").Split('|').Select(v=>v.Split(':')).ToDictionary(v=>v[0].ToLowerInvariant(),v=>Key(v[1]));
