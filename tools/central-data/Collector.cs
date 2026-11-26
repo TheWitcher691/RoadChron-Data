@@ -54,7 +54,15 @@ internal static class Collector
             bool previousApproved=prior!=null&&prior.Def.Count==0&&oldQuotes.Count==prior.AdBlue.Count&&
                 (prior.Ats==null||oldAts?.Prices.Count==prior.Ats.Prices.Count)&&
                 (prior.Ets2==null||oldEts?.Prices.Count==prior.Ets2.Prices.Count);
-            if(previousApproved&&prior!.GeneratedUtc>=now.AddDays(-6)){Console.WriteLine("Already published recently; no requests sent.");return 0;}
+bool forceRefresh =
+    Environment.GetEnvironmentVariable("GITHUB_EVENT_NAME") == "workflow_dispatch" ||
+    Environment.GetEnvironmentVariable("ROADCHRON_ROMANIA_SCHEDULED") == "true";
+
+if (!forceRefresh && previousApproved && prior!.GeneratedUtc >= now.AddDays(-6))
+{
+    Console.WriteLine("Already published recently; no requests sent.");
+    return 0;
+}
             string root=Path.Combine(Path.GetTempPath(),"roadchron-collector-"+Guid.NewGuid().ToString("N"));Directory.CreateDirectory(root);
             using var cts=new CancellationTokenSource(TimeSpan.FromMinutes(20));var ct=cts.Token;
             try {
