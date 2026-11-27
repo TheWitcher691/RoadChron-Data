@@ -52,6 +52,42 @@ internal static class RealFuelPrices
         }
         return new(dates.Values.Max(), prices, dates, sources, current.Expired, estimated.Count==0?null:estimated);
     }
+    // Local simulation only. Never persist this result as observations or sign it.
+    internal static Feed CompleteEuropeanFeed(Feed raw, DateTime now)
+    {
+        var prices = new Dictionary<string, Price>(raw.Prices, StringComparer.Ordinal);
+        var dates = raw.Prices.Keys.ToDictionary(k => k, raw.DateFor, StringComparer.Ordinal);
+        var sources = raw.Sources == null ? new Dictionary<string,string>() : new Dictionary<string,string>(raw.Sources);
+        var flags = raw.Estimated == null ? new Dictionary<string,string[]>() : new Dictionary<string,string[]>(raw.Estimated);
+        // Use fresh observed values only; never feed an estimate back into the model.
+        var anchors = raw.Prices.Where(p => raw.DateFor(p.Key).Date >= now.Date.AddDays(-ObservationAgeDays(p.Key)) &&
+            raw.DateFor(p.Key).Date <= now.Date.AddDays(1)).ToArray();
+        decimal? Median(string field, Func<Price,decimal?> get)
+        {
+            var values = anchors.Where(p => !raw.IsEstimated(p.Key,field)).Select(p => get(p.Value))
+                .Where(v => ValidPrice(v)).Select(v => v!.Value).Order().ToArray();
+            return values.Length == 0 ? null : Math.Round((values[(values.Length-1)/2]+values[values.Length/2])/2,4);
+        }
+        var petrol = Median("Petrol", p => p.Petrol);
+        var diesel = Median("Diesel", p => p.Diesel);
+        if (petrol == null && diesel == null) return raw;
+        var anchorDate = anchors.Select(p => raw.DateFor(p.Key)).Min();
+        foreach (var key in DiagnosticRegions(false))
+        {
+            var existing = prices.GetValueOrDefault(key) ?? new Price(null,null);
+            var estimated = flags.GetValueOrDefault(key)?.ToList() ?? new List<string>();
+            var p = existing.Petrol; var d = existing.Diesel;
+            if (p == null && petrol != null) { p = petrol; estimated.Add("Petrol"); }
+            if (d == null && diesel != null) { d = diesel; estimated.Add("Diesel"); }
+            if (estimated.Count == 0 || p == null && d == null) continue;
+            prices[key] = existing with { Petrol=p, Diesel=d };
+            flags[key] = estimated.Distinct(StringComparer.Ordinal).ToArray();
+            if (!dates.ContainsKey(key)) dates[key]=anchorDate;
+            if (!raw.Prices.ContainsKey(key)) sources[key]="RoadChron EU median (simulation estimate)";
+        }
+        return raw with { Prices=prices, RegionDates=dates, Sources=sources, Estimated=flags };
+    }
+
     private static readonly Regex Row = new(@"<tr\b[^>]*>(.*?)</tr\s*>", RegexOptions.IgnoreCase | RegexOptions.Singleline);
     private static readonly Regex Cell = new(@"<t[dh]\b[^>]*>(.*?)</t[dh]\s*>", RegexOptions.IgnoreCase | RegexOptions.Singleline);
     private static string Plain(string value) => Regex.Replace(WebUtility.HtmlDecode(Regex.Replace(value, "<[^>]+>", " ")), @"\s+", " ").Trim();
@@ -296,7 +332,7 @@ internal static class RealFuelPrices
         Write(archive, "manifest.sii", "SiiNunit\n{\nmod_package : .package_name {\n package_version: \"0.4\"\n display_name: \"RoadChron Real Fuel Prices 0.4 AUTO\"\n author: \"RoadChron\"\n category[]: \"other\"\n description_file: \"mod_description.txt\"\n}\n}\n");
         var oldest = feed.Prices.Keys.Select(feed.DateFor).DefaultIfEmpty(feed.Date).Min();
         var dates = oldest.Date == feed.Date.Date ? DateLabel(feed.Date) : $"{DateLabel(oldest)} to {DateLabel(feed.Date)} (includes cached observations)";
-        Write(archive, "mod_description.txt", "RoadChron Real Fuel Prices 0.4 AUTO\nObservation dates: " + dates + "\n" + ("Sources: " + string.Join("; ",feed.Prices.Keys.Select(k=>feed.Sources?.GetValueOrDefault(k)??(ats?AtsSource:EtsSource)).Distinct()) + (feed.Estimated?.Count>0?". Includes RoadChron regional estimates, not direct state observations.":".") + (ats?" EIA data, where used: U.S. Energy Information Administration.":" EU EnergyPrices (CC BY 4.0), EU Oil Bulletin, SSB, DESNZ, BFS where used.")) + "\nCountry fuel definitions, sign board prices and currency rates. Exchange rates: " + AdBlueRealPrices.FxUrl + " (where available).\n");
+        Write(archive, "mod_description.txt", "RoadChron Real Fuel Prices 0.4 AUTO\nObservation dates: " + dates + "\n" + ("Sources: " + string.Join("; ",feed.Prices.Keys.Select(k=>feed.Sources?.GetValueOrDefault(k)??(ats?AtsSource:EtsSource)).Distinct()) + (feed.Estimated?.Count>0?". Includes RoadChron simulation estimates, not direct region observations.":".") + (ats?" EIA data, where used: U.S. Energy Information Administration.":" EU EnergyPrices (CC BY 4.0), EU Oil Bulletin, SSB, DESNZ, BFS where used.")) + "\nCountry fuel definitions, sign board prices and currency rates. Exchange rates: " + AdBlueRealPrices.FxUrl + " (where available); supplemental blended reference rates: https://frankfurter.dev/ (where available, not ECB rates).\n");
         return count;
     }
     private static readonly Dictionary<string,string> UsCodes = ("AL:Alabama|AK:Alaska|AZ:Arizona|AR:Arkansas|CA:California|CO:Colorado|CT:Connecticut|DE:Delaware|DC:District of Columbia|FL:Florida|GA:Georgia|HI:Hawaii|ID:Idaho|IL:Illinois|IN:Indiana|IA:Iowa|KS:Kansas|KY:Kentucky|LA:Louisiana|ME:Maine|MD:Maryland|MA:Massachusetts|MI:Michigan|MN:Minnesota|MS:Mississippi|MO:Missouri|MT:Montana|NE:Nebraska|NV:Nevada|NH:New Hampshire|NJ:New Jersey|NM:New Mexico|NY:New York|NC:North Carolina|ND:North Dakota|OH:Ohio|OK:Oklahoma|OR:Oregon|PA:Pennsylvania|RI:Rhode Island|SC:South Carolina|SD:South Dakota|TN:Tennessee|TX:Texas|UT:Utah|VT:Vermont|VA:Virginia|WA:Washington|WV:West Virginia|WI:Wisconsin|WY:Wyoming").Split('|').Select(v=>v.Split(':')).ToDictionary(v=>v[0].ToLowerInvariant(),v=>Key(v[1]));

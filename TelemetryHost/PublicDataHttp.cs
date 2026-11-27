@@ -49,7 +49,7 @@ internal static class PublicDataHttp
     // Publisher policy is intentionally narrower than legacy provenance validation.
     internal static bool UkCsvAllowed(Uri? uri)=>uri is {IsAbsoluteUri:true}&&uri.Scheme=="https"&&uri.IsDefaultPort&&uri.UserInfo.Length==0&&uri.Query.Length==0&&uri.Fragment.Length==0&&uri.Host=="assets.publishing.service.gov.uk"&&Regex.IsMatch(uri.AbsolutePath,@"\A/media/[a-f0-9]{24}/(?:CSV__2018_-__|weekly_road_fuel_prices_[0-9]{6})\.csv\z");
     internal static bool CollectorAllowed(Uri? uri) => uri is {IsAbsoluteUri:true} && (
-        uri.AbsoluteUri == RealFuelPrices.EuropeCsv ||
+        uri.AbsoluteUri == RealFuelPrices.EuropeCsv || uri.AbsoluteUri == new Uri(AdBlueRealPrices.SupplementFxUrl).AbsoluteUri ||
 #if ROADCHRON_COLLECTOR
         global::EiaWorkbooks.Urls.Contains(uri.AbsoluteUri, StringComparer.Ordinal) ||
 #endif

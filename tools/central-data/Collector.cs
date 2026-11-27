@@ -73,11 +73,17 @@ internal static class Collector
                 var ets=await Try("EU EnergyPrices",async()=>ParseEurope(await http.GetStringAsync(RealFuelPrices.EuropeCsv,ct),DateTime.UtcNow),providers,ct);
                 var fx=await Try("ECB",async()=>AdBlueRealPrices.ParseFx(await http.GetStringAsync(AdBlueRealPrices.FxUrl,ct),DateTime.UtcNow),providers,ct);
                 if(fx!=null){
+                    var extra=await Try("Frankfurter FX",async()=>AdBlueRealPrices.ParseSupplementFx(
+                        await http.GetStringAsync(AdBlueRealPrices.SupplementFxUrl,ct),DateTime.UtcNow),providers,ct);
+                    if(extra!=null&&extra.Rates.Count<AdBlueRealPrices.SupplementCurrencies.Length)
+                        providers["Frankfurter FX"]=new("partial",$"Current blended rates: {extra.Rates.Count}/{AdBlueRealPrices.SupplementCurrencies.Length}.");
+                    fx=AdBlueRealPrices.MergeSupplementFx(fx,extra,AdBlueRealPrices.UsableFx(prior?.Fx,DateTime.UtcNow),DateTime.UtcNow);
                     var uk=ets?.Prices.ContainsKey("unitedkingdom")==true&&ets.DateFor("unitedkingdom")>=DateTime.UtcNow.Date.AddDays(-9)?null:await Try("UK DESNZ",()=>ReadUkAsync(http,fx,ct),providers,ct);
                     var norway=ets?.Prices.ContainsKey("norway")==true?null:await Try("Norway SSB",async()=>ParseNorway(await http.GetStringAsync(RealFuelPrices.NorwayData,ct),fx,DateTime.UtcNow),providers,ct);
                     ets=Merge(uk,ets,false,DateTime.UtcNow);
                     ets=Merge(norway,ets,false,DateTime.UtcNow);
                 }
+                if(!providers.ContainsKey("Frankfurter FX"))providers["Frankfurter FX"]=new("skipped","No new ECB base rates; prior valid rates retained if available.");
                 var quote=await Try("MITECO",async()=>AdBlueRealPrices.ParseSpainProduct(
                     await http.GetStringAsync(AdBlueRealPrices.SpainProductUrl,ct),DateTime.UtcNow)??
                     throw new InvalidDataException("No current Spanish AdBlue pump sample."),providers,ct);
@@ -107,7 +113,7 @@ internal static class Collector
                 now=DateTime.UtcNow;
                 if(ats==null&&ets==null&&fx==null&&quote==null&&romania==null&&vat.Count==0)throw new InvalidDataException("All approved sources failed; previous publication preserved.");
                 var quotes=CentralPriceFeed.MergeAdBlue(oldQuotes,new[]{quote,romania}.OfType<AdBlueRealPrices.Quote>().Concat(vat),now);
-                var rates=fx??prior?.Fx;
+                var rates=AdBlueRealPrices.UsableFx(fx??prior?.Fx,now);
                 var payload=new CentralPriceFeed.Payload(1,now,MergeUs(ats,oldAts,now),Merge(ets,oldEts,false,now),
                     quotes,new(),AdBlueRealPrices.ValidFx(rates,now)?rates:null,providers);
                 string signed=CentralPriceFeed.Sign(payload,signing);CentralPriceFeed.Verify(signed,config.PublicKeyPem,now);
@@ -372,6 +378,11 @@ internal static class Collector
         var uk=ParseUk("Date,ULSP (Ultra low sulphur unleaded petrol) Pump price in pence/litre,ULSD (Ultra low sulphur diesel) Pump price in pence/litre\n23/11/2026,120,160",fx,now);
         Check(uk.Prices["unitedkingdom"].Diesel==2m,"UK pence and GBP conversion");
         Check(PublicDataHttp.CollectorAllowed(new(RealFuelPrices.NorwayData))&&!PublicDataHttp.CollectorAllowed(new(RealFuelPrices.NorwayData+"&other=1")),"fixed SSB query only");
+        var supplemental=AdBlueRealPrices.ParseSupplementFx("[{\"base\":\"EUR\",\"quote\":\"RSD\",\"rate\":117,\"date\":\"2026-11-25\"}]",now);
+        var ecb=new AdBlueRealPrices.Fx(now,now,new(){["EUR"]=1m,["USD"]=1.1m,["PLN"]=4m,["CZK"]=25m,["CAD"]=1.5m,["MXN"]=20m});
+        var complete=AdBlueRealPrices.MergeSupplementFx(ecb,supplemental,null,now);
+        Check(complete.Rates["RSD"]==117m&&complete.SupplementDates!["RSD"]==now.AddDays(-1)&&AdBlueRealPrices.ValidFx(complete,now),"supplementary blended FX with original observation date");
+        Check(PublicDataHttp.CollectorAllowed(new(AdBlueRealPrices.SupplementFxUrl))&&!PublicDataHttp.CollectorAllowed(new(AdBlueRealPrices.SupplementFxUrl+"&expand=providers")),"exact blended FX endpoint only");
         Check(RomaniaAllowed("true",true)&&!RomaniaAllowed("false",true)&&!RomaniaAllowed(null,true)&&!RomaniaAllowed("true",false),"RO scheduled quota gate");
         Check(MergeUs(BuildUs([table,null,null,null]),feed,now)==feed,"partial EIA outage preserves recent complete set and dates");
         Check(Merge(null,feed,true,now.AddDays(31))==null,"retention capped without re-dating");

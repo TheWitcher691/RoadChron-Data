@@ -18,7 +18,7 @@ internal static class CentralPriceFeed
     internal sealed record ProviderStatus(string State, string? Detail = null);
     internal static readonly HashSet<string> ProviderNames = [
         "EIA Petrol", "EIA Diesel", "EIA MidGrade", "EIA Premium", "EU EnergyPrices",
-        "UK DESNZ", "Norway SSB", "ECB", "MITECO", "PretCarburant RO", "VATservice"
+        "UK DESNZ", "Norway SSB", "ECB", "Frankfurter FX", "MITECO", "PretCarburant RO", "VATservice"
     ];
     internal sealed record Envelope(string Payload, string Signature);
     private static readonly SemaphoreSlim Gate = new(1);
@@ -107,7 +107,34 @@ internal static class CentralPriceFeed
         if(force)return !Valid(state.AttemptUtc)||now-state.AttemptUtc>=ManualCooldown;
         return !Valid(state.AttemptUtc)||now-state.AttemptUtc>=RefreshInterval;
     }
-    internal static async Task<Payload?> GetAsync(string root,CancellationToken ct,bool force=false)
+    internal static bool RetryableDownload(Exception error, CancellationToken ct)
+    {
+        if(ct.IsCancellationRequested)return false;
+        if(error is OperationCanceledException)return error.InnerException is TimeoutException;
+        if(error is not HttpRequestException request||request.StatusCode.HasValue)return false;
+        // Never retry an explicit certificate/authentication rejection. A reset during TLS may be transient.
+        for(Exception? cause=error;cause!=null;cause=cause.InnerException)
+            if(cause is System.Security.Authentication.AuthenticationException)return false;
+        return request.HttpRequestError is HttpRequestError.ConnectionError or HttpRequestError.NameResolutionError or HttpRequestError.ResponseEnded
+            || ((request.HttpRequestError is HttpRequestError.SecureConnectionError or HttpRequestError.Unknown)
+                && (request.InnerException is IOException or System.Net.Sockets.SocketException));
+    }
+    internal static async Task<string> DownloadWithRetryAsync(Func<CancellationToken,Task<string>> download,
+        Action<int>? progress, Action<string> log, CancellationToken ct, Func<TimeSpan,CancellationToken,Task>? delay=null)
+    {
+        delay??=Task.Delay;
+        for(int attempt=1;;attempt++) {
+            ct.ThrowIfCancellationRequested();
+            progress?.Invoke(attempt);
+            try { return await download(ct); }
+            catch(Exception ex) when(attempt<3&&RetryableDownload(ex,ct)) {
+                int seconds=attempt==1?2:5;
+                log($"Central HTTPS attempt {attempt}/3 failed: {ex.GetType().Name}: {ex.Message}; retry in {seconds}s.");
+                await delay(TimeSpan.FromSeconds(seconds),ct);
+            }
+        }
+    }
+    internal static async Task<Payload?> GetAsync(string root,CancellationToken ct,bool force=false,Action<int>? progress=null)
     {
         var config=Configuration;
         if(config==null) { if(force)throw new InvalidOperationException("Central feed not configured.");return null; }
@@ -125,8 +152,11 @@ internal static class CentralPriceFeed
             }
             AdBlueRealPrices.Atomic(statePath,JsonSerializer.Serialize(new RefreshState(now,state?.SuccessUtc)));
             try {
-                using var http=PublicDataHttp.Create(root,20,MaxBytes,Endpoint(config.Url));
-                var text=await http.GetStringAsync(config.Url,ct);
+                var text=await DownloadWithRetryAsync(async token=>{
+                    if(PublicDataHttp.Offline(root))throw new InvalidOperationException("Public downloads disabled (offline mode).");
+                    using var http=PublicDataHttp.Create(root,20,MaxBytes,Endpoint(config.Url));
+                    return await http.GetStringAsync(config.Url,token);
+                },progress,message=>Log(root,message),ct);
                 var current=Verify(text,config.PublicKeyPem,DateTime.UtcNow);
                 if(current.GeneratedUtc<now.AddDays(-14)||old!=null&&current.GeneratedUtc<old.GeneratedUtc)
                     throw new InvalidDataException("Stale or rolled-back central feed.");

@@ -14,7 +14,10 @@ internal static class AdBlueRealPrices
     internal const string FxUrl = "https://www.ecb.europa.eu/stats/eurofxref/eurofxref-daily.xml";
     private static readonly CultureInfo Inv = CultureInfo.InvariantCulture;
     private static readonly SemaphoreSlim FxGate = new(1);
-    internal sealed record Fx(DateTime Fetched, DateTime Date, Dictionary<string, decimal> Rates);
+    internal const string SupplementFxUrl = "https://api.frankfurter.dev/v2/rates?base=EUR&quotes=ALL,BAM,MKD,RSD,RUB";
+    internal static readonly string[] SupplementCurrencies = ["ALL","BAM","MKD","RSD","RUB"];
+    internal sealed record Fx(DateTime Fetched, DateTime Date, Dictionary<string, decimal> Rates, Dictionary<string,DateTime>? SupplementDates=null);
+    internal sealed record SupplementFx(Dictionary<string,decimal> Rates,Dictionary<string,DateTime> Dates);
     internal sealed record Quote(string Country, string Currency, decimal Local, DateTime Checked, string Source, DateTime? Published=null, int? Samples=null);
     internal sealed record CountryPrice(decimal Eur, string Kind, string Source);
     internal sealed record Source(string Country, string Currency, string Url, string Pattern, string? DatePattern=null);
@@ -85,14 +88,63 @@ internal static class AdBlueRealPrices
             return new(now,date,rates);
         } catch (Exception ex) when (ex is XmlException or InvalidOperationException) { throw new InvalidDataException("Invalid ECB XML",ex); }
     }
+    // Frankfurter's blended EUR rates, not the underlying individual provider feeds.
+    internal static SupplementFx ParseSupplementFx(string json,DateTime now)
+    {
+        if(json.Length>128*1024)throw new InvalidDataException("Supplementary FX response too large.");
+        using var doc=JsonDocument.Parse(json);
+        if(doc.RootElement.ValueKind!=JsonValueKind.Array||doc.RootElement.GetArrayLength()>SupplementCurrencies.Length)
+            throw new InvalidDataException("Invalid supplementary FX response.");
+        var rates=new Dictionary<string,decimal>(StringComparer.Ordinal);
+        var dates=new Dictionary<string,DateTime>(StringComparer.Ordinal);
+        var seen=new HashSet<string>(StringComparer.Ordinal);
+        foreach(var row in doc.RootElement.EnumerateArray()) {
+            var code=row.GetProperty("quote").GetString()??"";
+            if(row.GetProperty("base").GetString()!="EUR"||!SupplementCurrencies.Contains(code,StringComparer.Ordinal)||!seen.Add(code)||
+                !row.GetProperty("rate").TryGetDecimal(out var rate)||rate is <.000001m or >1000000m||
+                !DateTime.TryParseExact(row.GetProperty("date").GetString(),"yyyy-MM-dd",Inv,DateTimeStyles.None,out var date)||date.Date>now.Date)
+                throw new InvalidDataException("Invalid or duplicate supplementary FX rate.");
+            if(date.Date<now.Date.AddDays(-14))continue;
+            rates.Add(code,rate);dates.Add(code,date.Date);
+        }
+        if(rates.Count==0)throw new InvalidDataException("No current supplementary FX rates.");
+        return new(rates,dates);
+    }
+    internal static Fx MergeSupplementFx(Fx ecb,SupplementFx? incoming,Fx? prior,DateTime now)
+    {
+        var rates=new Dictionary<string,decimal>(ecb.Rates,StringComparer.Ordinal);
+        var dates=new Dictionary<string,DateTime>(StringComparer.Ordinal);
+        foreach(var code in SupplementCurrencies) {
+            if(rates.ContainsKey(code))continue; // ECB always has priority.
+            var date=DateTime.MinValue;decimal rate=0;
+            if(prior?.SupplementDates?.TryGetValue(code,out var oldDate)==true&&prior.Rates.TryGetValue(code,out var oldRate))
+                (date,rate)=(oldDate,oldRate);
+            if(incoming?.Dates.TryGetValue(code,out var newDate)==true&&incoming.Rates.TryGetValue(code,out var newRate)&&newDate>=date)
+                (date,rate)=(newDate,newRate);
+            if(date.Date<now.Date.AddDays(-14)||date.Date>ecb.Fetched.Date||rate is <.000001m or >1000000m)continue;
+            rates[code]=rate;dates[code]=date.Date;
+        }
+        return ecb with {Rates=rates,SupplementDates=dates.Count==0?null:dates};
+    }
+    internal static Fx? UsableFx(Fx? fx,DateTime now)
+    {
+        if(!ValidFx(fx,now))return null;
+        if(fx!.SupplementDates==null)return fx;
+        var rates=new Dictionary<string,decimal>(fx.Rates,StringComparer.Ordinal);
+        var dates=new Dictionary<string,DateTime>(fx.SupplementDates,StringComparer.Ordinal);
+        foreach(var code in dates.Where(p=>p.Value.Date<now.Date.AddDays(-14)).Select(p=>p.Key).ToArray()) {rates.Remove(code);dates.Remove(code);}
+        return fx with {Rates=rates,SupplementDates=dates.Count==0?null:dates};
+    }
     internal static bool ValidFx(Fx? fx, DateTime now) => fx != null && fx.Fetched <= now.AddMinutes(5) && fx.Fetched >= now.AddDays(-30)
         && fx.Date.Date <= now.Date && fx.Date.Date >= now.Date.AddDays(-30) && RealFuelPrices.ValidRates(fx.Rates)
-        && fx.Rates.ContainsKey("PLN") && fx.Rates.ContainsKey("CZK") && fx.Rates.ContainsKey("CAD") && fx.Rates.ContainsKey("MXN");
+        && fx.Rates.ContainsKey("PLN") && fx.Rates.ContainsKey("CZK") && fx.Rates.ContainsKey("CAD") && fx.Rates.ContainsKey("MXN")
+        && (fx.SupplementDates==null||fx.SupplementDates.All(p=>SupplementCurrencies.Contains(p.Key,StringComparer.Ordinal)&&fx.Rates.ContainsKey(p.Key)&&
+            p.Value.Date==p.Value&&p.Value.Date<=fx.Fetched.Date&&p.Value.Date>=fx.Fetched.Date.AddDays(-14)));
     internal static async Task<Fx?> GetFxAsync(string root, CancellationToken ct)
     {
         await FxGate.WaitAsync(ct);
         try {
-            var path=Path.Combine(root,FxCacheName); var cached=Load<Fx>(path); var now=DateTime.UtcNow;
+            var path=Path.Combine(root,FxCacheName); var now=DateTime.UtcNow; var cached=UsableFx(Load<Fx>(path),now);
             bool valid=ValidFx(cached,now);
             #if ROADCHRON_COLLECTOR
             if(valid && now-cached!.Fetched<TimeSpan.FromHours(24))return cached;
@@ -105,7 +157,7 @@ internal static class AdBlueRealPrices
             try { using var fxHttp=PublicDataHttp.Create(root,15,1024*1024); var fx=ParseFx(await fxHttp.GetStringAsync(FxUrl,ct),now); Save(path,fx);return fx; }
             catch(Exception ex) when(!ct.IsCancellationRequested){Log(root,"ECB offline: "+ex.Message);return valid?cached:null;}
 #else
-            var central=(await CentralPriceFeed.GetAsync(root,ct))?.Fx;
+            var central=UsableFx((await CentralPriceFeed.GetAsync(root,ct))?.Fx,now);
             if(ValidFx(central,now)&&(!valid||central!.Date>=cached!.Date&&central.Fetched>=cached.Fetched)){Save(path,central);return central;}
             return valid?cached:null;
 #endif
@@ -289,7 +341,7 @@ internal static class AdBlueRealPrices
                         nextCacheRead=now.AddSeconds(5);
                         var quoteWrite=File.GetLastWriteTimeUtc(quotesPath);var fxWrite=File.GetLastWriteTimeUtc(fxPath);
                         if(quoteWrite!=lastQuoteWrite||fxWrite!=lastFxWrite){
-                            quotes=Load<List<Quote>>(quotesPath)??quotes;fx=Load<Fx>(fxPath)??fx;
+                            quotes=Load<List<Quote>>(quotesPath)??quotes;fx=Load<Fx>(fxPath);
                             lastQuoteWrite=quoteWrite;lastFxWrite=fxWrite;nextEvaluation=DateTime.MinValue;
                         }
                     }
