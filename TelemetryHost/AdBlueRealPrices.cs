@@ -15,7 +15,7 @@ internal static class AdBlueRealPrices
     private static readonly CultureInfo Inv = CultureInfo.InvariantCulture;
     private static readonly SemaphoreSlim FxGate = new(1);
     internal sealed record Fx(DateTime Fetched, DateTime Date, Dictionary<string, decimal> Rates);
-    internal sealed record Quote(string Country, string Currency, decimal Local, DateTime Checked, string Source, DateTime? Published=null);
+    internal sealed record Quote(string Country, string Currency, decimal Local, DateTime Checked, string Source, DateTime? Published=null, int? Samples=null);
     internal sealed record CountryPrice(decimal Eur, string Kind, string Source);
     internal sealed record Source(string Country, string Currency, string Url, string Pattern, string? DatePattern=null);
     internal static readonly Source[] Sources = [
@@ -31,6 +31,7 @@ internal static class AdBlueRealPrices
         new("A", "EUR", "https://www.avia-moser.at/autopflege/tankstellenfinder-avia-wash-49686.html", @"\bAdBlue\s*:\s*€\s*(\d{1,3}[,.]\d{2,3})")
     ];
     internal const string SpainUrl = "https://sedeaplicaciones.minetur.gob.es/ServiciosRESTCarburantes/PreciosCarburantes/EstacionesTerrestres/";
+    internal const string SpainProductUrl = "https://energia.serviciosmin.gob.es/ServiciosRestCarburantes/PreciosCarburantes/EstacionesTerrestres/FiltroProducto/26";
     internal const string RomaniaUrl = "https://pretcarburant.ro/api/v1/statii?tip=adblue";
     // Optional catalogue prices: enable network collection only after written permission.
     internal static readonly (string Country,string Currency,string Url)[] VatSources = [
@@ -56,7 +57,7 @@ internal static class AdBlueRealPrices
     }
     // Data provenance is separate from the network allowlist. Only these feeds are approved for publication.
     internal static bool ApprovedQuote(Quote q) =>
-        (q.Country=="E" && q.Currency=="EUR" && q.Source==SpainUrl) ||
+        (q.Country=="E" && q.Currency=="EUR" && (q.Source==SpainUrl||q.Source==SpainProductUrl)) ||
         (q.Country=="RO" && q.Currency=="RON" && q.Source==RomaniaUrl);
     // Tachograph country codes, land neighbours. No recursive estimates are used as observations.
     internal static readonly Dictionary<string,string> Neighbours = new(StringComparer.OrdinalIgnoreCase) {
@@ -141,6 +142,37 @@ internal static class AdBlueRealPrices
         }
         return prices.Count>=10?prices.Average():null;
     }
+    internal static Quote? ParseSpainProduct(string json, DateTime now)
+    {
+        using var doc = JsonDocument.Parse(json);
+        var root = doc.RootElement;
+        if (root.GetProperty("ResultadoConsulta").GetString() != "OK" ||
+            !DateTime.TryParseExact(root.GetProperty("Fecha").GetString(), ["dd/MM/yyyy H:mm:ss","dd/MM/yyyy HH:mm:ss"],
+                Inv, DateTimeStyles.None, out var snapshot) ||
+            snapshot.Date < now.Date.AddDays(-7) || snapshot.Date > now.Date.AddDays(1)) return null;
+
+        var stations = new Dictionary<string, decimal>(StringComparer.Ordinal);
+        var conflicts = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var row in root.GetProperty("ListaEESSPrecio").EnumerateArray())
+        {
+            if (Field(row, "Tipo Venta")?.Trim() != "P" ||
+                Field(row, "IDEESS") is not { Length: > 0 } id ||
+                ParseLocal(Field(row, "PrecioProducto")) is not decimal price ||
+                price is < .05m or > 5m) continue;
+            if (!stations.TryAdd(id, price) && stations[id] != price) conflicts.Add(id);
+        }
+
+        foreach (var id in conflicts) stations.Remove(id);
+        if (stations.Count < 10) return null;
+        var prices = stations.Values.Order().ToArray();
+        return new("E", "EUR", (prices[(prices.Length-1)/2] + prices[prices.Length/2])/2,
+            now, SpainProductUrl, snapshot.Date, prices.Length);
+
+        static string? Field(JsonElement row, string name) =>
+            row.ValueKind==JsonValueKind.Object && row.TryGetProperty(name,out var value) &&
+            value.ValueKind==JsonValueKind.String ? value.GetString() : null;
+    }
+
     // PretCarburant public station sample, CC BY 4.0. Reject ambiguous, undated or stale observations.
     internal static Quote? ParseRomania(string json, DateTime now)
     {
@@ -163,7 +195,7 @@ internal static class AdBlueRealPrices
         }
         foreach(var id in conflicts)stations.Remove(id);
         if(stations.Count<3)return null;
-        return new("RO","RON",stations.Values.Average(v=>v.Price),now,RomaniaUrl,stations.Values.Min(v=>v.Date));
+        return new("RO","RON",stations.Values.Average(v=>v.Price),now,RomaniaUrl,stations.Values.Min(v=>v.Date),stations.Count);
         static string? Text(JsonElement e,string key)=>e.TryGetProperty(key,out var v)&&v.ValueKind==JsonValueKind.String?v.GetString():null;
         static bool Flag(JsonElement e,string key)=>e.TryGetProperty(key,out var v)&&v.ValueKind!=JsonValueKind.False&&v.ValueKind!=JsonValueKind.Null;
     }
@@ -183,11 +215,15 @@ internal static class AdBlueRealPrices
         var result=new Dictionary<string,CountryPrice>(observations,StringComparer.OrdinalIgnoreCase);
         // Gross-price scenario factors, NOT observed national price ratios or VAT rates.
         // Recalibrate when adequate legal measurements become available.
-        var recent=observations.Where(p=>p.Value.Kind is "public" or "catalogue").ToArray();
-        var basis=recent.Length>0?recent:observations.ToArray();
+        var measuredAnchors=observations.Where(p=>p.Value.Kind=="public").ToArray();
+        var catalogAnchors=observations.Where(p=>p.Value.Kind=="catalogue").ToArray();
+        var basis=measuredAnchors.Length>0?measuredAnchors:catalogAnchors.Length>0?catalogAnchors:observations.ToArray();
+        // One country alone cannot recalibrate the entire continent.
+        var dataWeight=Math.Min(1m,basis.Length/3m);
         var normalized=basis.Select(p=>p.Value.Eur/IndexFactor(p.Key)).OrderBy(x=>x).ToArray();
         decimal reference=normalized.Length==0?.95m:normalized.Length%2==1?normalized[normalized.Length/2]:(normalized[normalized.Length/2-1]+normalized[normalized.Length/2])/2m;
-        string detail=normalized.Length==0?"RoadChron scenario baseline (no measurements)":"RoadChron median normalized anchors: "+string.Join(",",basis.Select(p=>p.Key).Order());
+        reference=.95m+(reference-.95m)*dataWeight;
+        string detail=normalized.Length==0?"RoadChron scenario baseline (no measurements)":"RoadChron anchors: "+string.Join(",",basis.Select(p=>p.Key).Order());
         result["EU"]=new(Math.Clamp(reference,.05m,5m),"index",detail);
         foreach(var country in Neighbours.Keys)
             if(!result.ContainsKey(country))result[country]=new(Math.Round(Math.Clamp(reference*IndexFactor(country),.05m,5m),4),"index",detail);

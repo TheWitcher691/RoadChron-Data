@@ -13,7 +13,13 @@ internal static class CentralPriceFeed
     internal sealed record Config(string Url, string PublicKeyPem);
     internal sealed record Payload(int Schema, DateTime GeneratedUtc, RealFuelPrices.Feed? Ats,
         RealFuelPrices.Feed? Ets2, List<AdBlueRealPrices.Quote> AdBlue,
-        Dictionary<string,DefRealPrices.Observation> Def, AdBlueRealPrices.Fx? Fx);
+        Dictionary<string,DefRealPrices.Observation> Def, AdBlueRealPrices.Fx? Fx,
+        Dictionary<string,ProviderStatus>? Providers = null);
+    internal sealed record ProviderStatus(string State, string? Detail = null);
+    internal static readonly HashSet<string> ProviderNames = [
+        "EIA Petrol", "EIA Diesel", "EIA MidGrade", "EIA Premium", "EU EnergyPrices",
+        "UK DESNZ", "Norway SSB", "ECB", "MITECO", "PretCarburant RO", "VATservice"
+    ];
     internal sealed record Envelope(string Payload, string Signature);
     private static readonly SemaphoreSlim Gate = new(1);
     private static readonly Lazy<Config?> BuiltIn = new(ReadConfiguration);
@@ -58,18 +64,21 @@ internal static class CentralPriceFeed
         if(p.Schema!=1||p.GeneratedUtc.Kind!=DateTimeKind.Utc||p.GeneratedUtc>now.AddMinutes(5)||p.GeneratedUtc==DateTime.MinValue||
             (!allowExpired&&p.GeneratedUtc<now.AddDays(-30))||p.AdBlue==null||p.Def==null||p.AdBlue.Count>100||p.Def.Count>51)
             throw new InvalidDataException("Invalid schema, timestamp or collection size.");
+        if(p.Providers?.Any(v=>!ProviderNames.Contains(v.Key)||v.Value==null||
+            v.Value.State is not ("ok" or "failed" or "skipped" or "partial")||
+            v.Value.Detail?.Length>300)==true)throw new InvalidDataException("Invalid provider diagnostics.");
         var reference=p.GeneratedUtc;
         foreach(var (feed,ats) in new[]{(p.Ats,true),(p.Ets2,false)}) {
             if(feed==null)continue;
             if(!RealFuelPrices.ValidFeed(feed,ats,reference)||feed.Date.Date>reference.Date.AddDays(1)||feed.Prices.Count>60||
-                feed.Prices.Keys.Any(k=>feed.DateFor(k).Date<reference.Date.AddDays(-30))||
+                feed.Prices.Keys.Any(k=>feed.DateFor(k).Date<reference.Date.AddDays(-Math.Max(30,RealFuelPrices.ObservationAgeDays(k))))||
                 feed.Sources?.Any(s=>!feed.Prices.ContainsKey(s.Key)||!PublicDataHttp.AllowedSource(s.Value))==true)
                 throw new InvalidDataException("Invalid fuel observations.");
         }
         var sourceKeys=new HashSet<(string,string)>();
         foreach(var q in p.AdBlue) {
             if(q==null||!AdBlueRealPrices.Neighbours.ContainsKey(q.Country)||q.Local<=0||q.Local>5000||
-                q.Checked>reference.AddMinutes(5)||q.Checked<reference.AddDays(-30)||q.Currency==null||!Regex.IsMatch(q.Currency,"^[A-Z]{3}$")||
+                q.Checked>reference.AddMinutes(5)||q.Checked<reference.AddDays(-30)||q.Samples is <1 or >10000||q.Currency==null||!Regex.IsMatch(q.Currency,"^[A-Z]{3}$")||
                 (q.Published is DateTime d&&(d.Date>q.Checked.Date.AddDays(1)||d.Date<q.Checked.Date.AddDays(-14)))||
                 !(AdBlueRealPrices.ApprovedQuote(q)||AdBlueRealPrices.VatQuote(q)||AdBlueRealPrices.Sources.Any(s=>s.Country==q.Country&&s.Currency==q.Currency&&s.Url==q.Source))||
                 !sourceKeys.Add((q.Country,q.Source)))throw new InvalidDataException("Invalid AdBlue observation.");
@@ -88,16 +97,15 @@ internal static class CentralPriceFeed
         try { if(new FileInfo(path).Length>MaxBytes)return null;return Verify(File.ReadAllText(path),key,now,allowExpired); }catch{return null;}
     }
     internal static readonly TimeSpan RefreshInterval = TimeSpan.FromHours(24);
-    internal static readonly TimeSpan RetryInterval = TimeSpan.FromMinutes(15);
+
     internal static readonly TimeSpan ManualCooldown = TimeSpan.FromMinutes(1);
     internal sealed record RefreshState(DateTime AttemptUtc, DateTime? SuccessUtc);
-    internal static bool CanRefresh(RefreshState? state, DateTime now, bool force, bool hasCache)
+    internal static bool CanRefresh(RefreshState? state, DateTime now, bool force)
     {
         if(state==null)return true;
         bool Valid(DateTime time)=>time!=DateTime.MinValue&&time<=now;
         if(force)return !Valid(state.AttemptUtc)||now-state.AttemptUtc>=ManualCooldown;
-        if(Valid(state.AttemptUtc)&&now-state.AttemptUtc<RetryInterval)return false;
-        return !hasCache||state.SuccessUtc is not DateTime success||!Valid(success)||state.AttemptUtc>success||now-success>=RefreshInterval;
+        return !Valid(state.AttemptUtc)||now-state.AttemptUtc>=RefreshInterval;
     }
     internal static async Task<Payload?> GetAsync(string root,CancellationToken ct,bool force=false)
     {
@@ -111,7 +119,7 @@ internal static class CentralPriceFeed
             if(PublicDataHttp.Offline(root)) { if(force)throw new InvalidOperationException("Public downloads disabled (offline mode).");return usable; }
             var statePath=Path.Combine(root,"central-refresh-v2.json");
             var state=AdBlueRealPrices.Load<RefreshState>(statePath);
-            if(!CanRefresh(state,now,force,usable!=null)) {
+            if(!CanRefresh(state,now,force)) {
                 if(force)throw new InvalidOperationException("Manual refresh cooldown: try again in one minute.");
                 return usable;
             }
@@ -137,7 +145,7 @@ internal static class CentralPriceFeed
     private static void Log(string root,string s)=>RoadChronBoundedFileAppender.AppendLine(Path.Combine(root,"central-prices.log"),$"[{DateTime.UtcNow:O}] {s}");
     internal static List<AdBlueRealPrices.Quote> MergeAdBlue(IEnumerable<AdBlueRealPrices.Quote> old,IEnumerable<AdBlueRealPrices.Quote> incoming,DateTime now) =>
         old.Concat(incoming).Where(q=>q!=null&&q.Checked>=now.AddDays(-30)&&q.Checked<=now.AddMinutes(5))
-            .GroupBy(q=>(q.Country,q.Source)).Select(g=>g.OrderByDescending(q=>q.Published??q.Checked).ThenByDescending(q=>q.Checked).First()).ToList();
+            .GroupBy(q=>(q.Country,Source:q.Source==AdBlueRealPrices.SpainUrl?AdBlueRealPrices.SpainProductUrl:q.Source)).Select(g=>g.OrderByDescending(q=>(q.Published??q.Checked).Date).ThenByDescending(q=>q.Checked).ThenByDescending(q=>q.Source==AdBlueRealPrices.SpainProductUrl).First()).ToList();
     internal static Dictionary<string,DefRealPrices.Observation> MergeDef(Dictionary<string,DefRealPrices.Observation> old,Dictionary<string,DefRealPrices.Observation> incoming,DateTime now) =>
         old.Concat(incoming).Where(q=>q.Value!=null&&q.Value.Checked>=now.AddDays(-30)&&q.Value.Checked<=now.AddMinutes(5))
             .GroupBy(q=>q.Key,StringComparer.Ordinal).ToDictionary(g=>g.Key,g=>g.MaxBy(q=>q.Value.Checked).Value,StringComparer.Ordinal);

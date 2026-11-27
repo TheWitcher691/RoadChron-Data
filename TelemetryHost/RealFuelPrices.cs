@@ -13,6 +13,7 @@ internal static class RealFuelPrices
 {
     internal const string AtsSource = "https://gasprices.aaa.com/todays-state-averages/";
     internal const string EtsSource = "https://www.euenergyprices.eu/en/fuel";
+    internal const string EuropeCsv = "https://www.euenergyprices.eu/api/data/fuel.csv";
     internal const string AmzsSource = "https://www.amzs.si/na-poti/cene-goriv-po-evropi";
     internal const string UkSource = "https://www.gov.uk/government/statistics/weekly-road-fuel-prices";
     internal const string NorwaySource = "https://www.ssb.no/en/statbank/table/09654";
@@ -60,6 +61,7 @@ internal static class RealFuelPrices
     internal static readonly Dictionary<string, string> EuropeanCountryCodes = ("at:Austria|be:Belgium|bg:Bulgaria|hr:Croatia|cy:Cyprus|cz:Czechia|dk:Denmark|ee:Estonia|fi:Finland|fr:France|de:Germany|gr:Greece|hu:Hungary|ie:Ireland|it:Italy|lv:Latvia|lt:Lithuania|lu:Luxembourg|mt:Malta|nl:Netherlands|no:Norway|pl:Poland|pt:Portugal|ro:Romania|sk:Slovakia|si:Slovenia|es:Spain|se:Sweden|ch:Switzerland|gb:United Kingdom")
         .Split('|').Select(x => x.Split(':')).ToDictionary(x => Key(x[1]), x => x[0], StringComparer.Ordinal);
     internal static string[] DiagnosticRegions(bool ats) => ats ? UsStates.Order().ToArray() : EuCodes.Values.Except(["cyprus","malta","ireland"]).Distinct().Order().ToArray();
+    internal static int ObservationAgeDays(string key) => key is "switzerland" or "norway" ? 45 : 14;
     internal static string[] GameCountries(string directory) => Directory.Exists(directory)
         ? Directory.EnumerateFiles(directory).Where(p => Path.GetExtension(p).ToLowerInvariant() is ".sui" or ".sii").Select(CountryKey).Distinct().Order().ToArray() : [];
     internal static string? RegionCode(string key) => EuCodes.FirstOrDefault(p => p.Value==key).Key;

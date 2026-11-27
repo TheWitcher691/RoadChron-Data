@@ -68,7 +68,7 @@ internal static class DefRealPrices
         }
         return states.ToDictionary(p=>p.Key,p=>new Observation(p.Value.Average(),checkedUtc,[PilotSource],p.Value.Count));
     }
-    private static readonly Dictionary<string,string> StateNames = ("AL:Alabama|AK:Alaska|AZ:Arizona|AR:Arkansas|CA:California|CO:Colorado|CT:Connecticut|DE:Delaware|DC:District of Columbia|FL:Florida|GA:Georgia|HI:Hawaii|ID:Idaho|IL:Illinois|IN:Indiana|IA:Iowa|KS:Kansas|KY:Kentucky|LA:Louisiana|ME:Maine|MD:Maryland|MA:Massachusetts|MI:Michigan|MN:Minnesota|MS:Mississippi|MO:Missouri|MT:Montana|NE:Nebraska|NV:Nevada|NH:New Hampshire|NJ:New Jersey|NM:New Mexico|NY:New York|NC:North Carolina|ND:North Dakota|OH:Ohio|OK:Oklahoma|OR:Oregon|PA:Pennsylvania|RI:Rhode Island|SC:South Carolina|SD:South Dakota|TN:Tennessee|TX:Texas|UT:Utah|VT:Vermont|VA:Virginia|WA:Washington|WV:West Virginia|WI:Wisconsin|WY:Wyoming").Split('|').Select(x=>x.Split(':')).ToDictionary(x=>x[0],x=>RealFuelPrices.Key(x[1]));
+    internal static readonly Dictionary<string,string> StateNames = ("AL:Alabama|AK:Alaska|AZ:Arizona|AR:Arkansas|CA:California|CO:Colorado|CT:Connecticut|DE:Delaware|DC:District of Columbia|FL:Florida|GA:Georgia|HI:Hawaii|ID:Idaho|IL:Illinois|IN:Indiana|IA:Iowa|KS:Kansas|KY:Kentucky|LA:Louisiana|ME:Maine|MD:Maryland|MA:Massachusetts|MI:Michigan|MN:Minnesota|MS:Mississippi|MO:Missouri|MT:Montana|NE:Nebraska|NV:Nevada|NH:New Hampshire|NJ:New Jersey|NM:New Mexico|NY:New York|NC:North Carolina|ND:North Dakota|OH:Ohio|OK:Oklahoma|OR:Oregon|PA:Pennsylvania|RI:Rhode Island|SC:South Carolina|SD:South Dakota|TN:Tennessee|TX:Texas|UT:Utah|VT:Vermont|VA:Virginia|WA:Washington|WV:West Virginia|WI:Wisconsin|WY:Wyoming").Split('|').Select(x=>x.Split(':')).ToDictionary(x=>x[0],x=>RealFuelPrices.Key(x[1]));
     internal static RealFuelPrices.Feed? VerifiedDiesel(string root,DateTime now) {
         var cfg=CentralPriceFeed.Configuration;
         return cfg==null?null:CentralPriceFeed.ReadVerified(Path.Combine(root,CentralPriceFeed.CacheName),cfg.PublicKeyPem,now)?.Ats;
@@ -82,13 +82,15 @@ internal static class DefRealPrices
             if(diesel.Sources?.GetValueOrDefault(key)!=RealFuelPrices.EiaSource||diesel.DateFor(key)<now.Date.AddDays(-30)||diesel.DateFor(key)>now.Date.AddDays(1))continue;
             if(diesel.Prices.TryGetValue(key,out var fuel)&&fuel.Diesel is decimal p&&p*LitresPerGallon is >=1m and <=12m)proxy[state]=p*LitresPerGallon;
         }
-        decimal center=proxy.Count>0?proxy.Values.Average():4m;
-        // Explicit simulation assumption: $3.50/gal at $4 diesel, 20% absolute pass-through.
-        decimal reference=basis.Count>0?basis.Values.Average(p=>p.UsdPerGallon):3.50m+.20m*(center-4m);
+        var fuelLevels=proxy.Values.Order().ToArray();
+        decimal center=fuelLevels.Length>0?(fuelLevels[(fuelLevels.Length-1)/2]+fuelLevels[fuelLevels.Length/2])/2:4m;
+        var anchors=basis.Values.Select(p=>p.UsdPerGallon).Order().ToArray();
+        // Explicit simulation assumption: $3.50/gal at $4 diesel, 10% absolute pass-through.
+        decimal reference=anchors.Length>0?(anchors[(anchors.Length-1)/2]+anchors[anchors.Length/2])/2:3.50m+.10m*(center-4m);
         var result=new Dictionary<string,Price>(direct){["USA"]=new(Math.Clamp(reference,.5m,15m),"index",0)};
         foreach(var state in Neighbours.Keys){
             if(result.ContainsKey(state))continue;
-            decimal offset=proxy.TryGetValue(state,out var local)?Math.Clamp(.25m*(local-center),-.75m,.75m):0m;
+            decimal offset=proxy.TryGetValue(state,out var local)?Math.Clamp(.15m*(local-center),-.45m,.45m):0m;
             result[state]=new(Math.Round(Math.Clamp(reference+offset,.5m,15m),4),"index",0);
         }
         return result;

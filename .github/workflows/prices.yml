@@ -22,8 +22,10 @@ jobs:
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '10.0.404'
-      - name: Build collector
-        run: dotnet build tools/central-data/Collector.csproj -c Release
+      - name: Restore and build collector
+        run: |
+          dotnet restore tools/central-data/Collector.csproj --locked-mode
+          dotnet build tools/central-data/Collector.csproj -c Release --no-restore
       - name: Test collector policy and parsing
         run: dotnet run --no-build -c Release --project tools/central-data/Collector.csproj -- selftest
       - name: Collect and sign approved sources
@@ -31,7 +33,11 @@ jobs:
           ROADCHRON_VATSERVICE_APPROVED: ${{ vars.ROADCHRON_VATSERVICE_APPROVED }}
           ROADCHRON_PRICE_SIGNING_KEY: ${{ secrets.ROADCHRON_PRICE_SIGNING_KEY }}
           ROADCHRON_ROMANIA_SCHEDULED: ${{ github.event_name == 'schedule' && github.run_attempt == 1 && 'true' || 'false' }}
-        run: dotnet run --no-build -c Release --project tools/central-data/Collector.csproj -- collect TelemetryHost/CentralPriceFeedConfig.json public/fuel-prices.json
+        shell: bash
+        run: |
+          args=()
+          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then args+=(--force); fi
+          dotnet run --no-build -c Release --project tools/central-data/Collector.csproj -- collect TelemetryHost/CentralPriceFeedConfig.json public/fuel-prices.json "${args[@]}"
       - uses: actions/upload-pages-artifact@v3
         with:
           path: public
