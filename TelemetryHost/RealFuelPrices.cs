@@ -1,6 +1,5 @@
 using System.Globalization;
 using System.IO.Compression;
-using System.Net;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
@@ -11,13 +10,15 @@ namespace RoadChron;
 // Source formats are deliberately validated: a changed web layout must not produce a mod.
 internal static class RealFuelPrices
 {
-    internal const string AtsSource = "https://gasprices.aaa.com/todays-state-averages/";
-    internal const string EtsSource = "https://www.euenergyprices.eu/en/fuel";
-    internal const string EuropeCsv = "https://www.euenergyprices.eu/api/data/fuel.csv";
-    internal const string AmzsSource = "https://www.amzs.si/na-poti/cene-goriv-po-evropi";
-    internal const string UkSource = "https://www.gov.uk/government/statistics/weekly-road-fuel-prices";
-    internal const string NorwaySource = "https://www.ssb.no/en/statbank/table/09654";
-    internal const string NorwayData = "https://data.ssb.no/api/pxwebapi/v2/tables/09654/data?lang=en&valueCodes%5BPetroleumProd%5D=031,035&valueCodes%5BTid%5D=top(1)&valueCodes%5BContentsCode%5D=Priser&outputFormat=json-stat2";
+    internal const string UsGasGaugeSource = "https://usgasgauge.com/gas-price-data";
+    internal const string UsGasGaugeRegular = "https://usgasgauge.com/gas-price-data/gas-prices-by-state-current.csv";
+    internal const string UsGasGaugeDiesel = "https://usgasgauge.com/gas-price-data/diesel-prices-weekly.csv";
+    // ATS rows tagged US Gas Gauge combine that provider with EIA for missing diesel regions and other grades.
+    internal static bool ApprovedUsSource(string? source) => source is EiaSource or UsGasGaugeSource;
+    internal static bool ApprovedFuelSource(string? source, bool ats) => ats ? ApprovedUsSource(source) : source == OpenVanSource;
+    internal const string OpenVanSource = "https://openvan.camp/";
+    internal const string OpenVanPrices = "https://openvan.camp/api/fuel/prices?source=RoadChron";
+    internal const string OpenVanFx = "https://openvan.camp/api/currency/rates?source=RoadChron";
     internal const string EiaSource = "https://www.eia.gov/dnav/pet/pet_pri_gnd_a_epmr_pte_dpgal_w.htm";
     internal static readonly string[] EiaPages = [EiaSource,
         "https://www.eia.gov/dnav/pet/pet_pri_gnd_a_epd2d_pte_dpgal_w.htm",
@@ -38,17 +39,19 @@ internal static class RealFuelPrices
         if (!ValidFeed(cached, ats, today)) return current;
         var prices = new Dictionary<string, Price>(current.Prices, StringComparer.Ordinal);
         var dates = current.Prices.Keys.ToDictionary(key => key, current.DateFor, StringComparer.Ordinal);
-        var sources = current.Prices.Keys.ToDictionary(key => key, key => current.Sources?.GetValueOrDefault(key) ?? (ats ? AtsSource : EtsSource));
+        var sources = current.Prices.Keys.ToDictionary(key => key, key => current.Sources?.GetValueOrDefault(key) ?? "RoadChron legacy cache (source unspecified)");
         var estimated = current.Estimated == null ? new Dictionary<string,string[]>(StringComparer.Ordinal) : new Dictionary<string,string[]>(current.Estimated, StringComparer.Ordinal);
         foreach (var (key, price) in cached!.Prices)
         {
             var date = cached.DateFor(key);
+            if (current.Prices.ContainsKey(key) && ApprovedFuelSource(current.Sources?.GetValueOrDefault(key), ats) &&
+                !ApprovedFuelSource(cached.Sources?.GetValueOrDefault(key), ats)) continue;
             if (dates.TryGetValue(key, out var currentDate) && currentDate >= date) continue;
             prices[key] = price;
             estimated.Remove(key);
             if(cached.Estimated?.TryGetValue(key,out var flags)==true)estimated[key]=flags;
             dates[key] = date;
-            sources[key] = cached.Sources?.GetValueOrDefault(key) ?? (ats ? AtsSource : EtsSource);
+            sources[key] = cached.Sources?.GetValueOrDefault(key) ?? "RoadChron legacy cache (source unspecified)";
         }
         return new(dates.Values.Max(), prices, dates, sources, current.Expired, estimated.Count==0?null:estimated);
     }
@@ -88,12 +91,8 @@ internal static class RealFuelPrices
         return raw with { Prices=prices, RegionDates=dates, Sources=sources, Estimated=flags };
     }
 
-    private static readonly Regex Row = new(@"<tr\b[^>]*>(.*?)</tr\s*>", RegexOptions.IgnoreCase | RegexOptions.Singleline);
-    private static readonly Regex Cell = new(@"<t[dh]\b[^>]*>(.*?)</t[dh]\s*>", RegexOptions.IgnoreCase | RegexOptions.Singleline);
-    private static string Plain(string value) => Regex.Replace(WebUtility.HtmlDecode(Regex.Replace(value, "<[^>]+>", " ")), @"\s+", " ").Trim();
     internal static string Key(string value) => new(value.ToLowerInvariant().Where(c => c is >= 'a' and <= 'z').ToArray());
     private static readonly HashSet<string> UsStates = new(("Alabama|Alaska|Arizona|Arkansas|California|Colorado|Connecticut|Delaware|District of Columbia|Florida|Georgia|Hawaii|Idaho|Illinois|Indiana|Iowa|Kansas|Kentucky|Louisiana|Maine|Maryland|Massachusetts|Michigan|Minnesota|Mississippi|Missouri|Montana|Nebraska|Nevada|New Hampshire|New Jersey|New Mexico|New York|North Carolina|North Dakota|Ohio|Oklahoma|Oregon|Pennsylvania|Rhode Island|South Carolina|South Dakota|Tennessee|Texas|Utah|Vermont|Virginia|Washington|West Virginia|Wisconsin|Wyoming").Split('|').Select(Key), StringComparer.Ordinal);
-    private static readonly HashSet<string> EuCountries = new(("Austria|Belgium|Bulgaria|Croatia|Cyprus|Czechia|Czech Republic|Denmark|Estonia|Finland|France|Germany|Greece|Hungary|Ireland|Italy|Latvia|Lithuania|Luxembourg|Malta|Netherlands|Norway|Poland|Portugal|Romania|Slovakia|Slovenia|Spain|Sweden|Switzerland|United Kingdom").Split('|').Select(Key), StringComparer.Ordinal);
     internal static readonly Dictionary<string, string> EuropeanCountryCodes = ("at:Austria|be:Belgium|bg:Bulgaria|hr:Croatia|cy:Cyprus|cz:Czechia|dk:Denmark|ee:Estonia|fi:Finland|fr:France|de:Germany|gr:Greece|hu:Hungary|ie:Ireland|it:Italy|lv:Latvia|lt:Lithuania|lu:Luxembourg|mt:Malta|nl:Netherlands|no:Norway|pl:Poland|pt:Portugal|ro:Romania|sk:Slovakia|si:Slovenia|es:Spain|se:Sweden|ch:Switzerland|gb:United Kingdom")
         .Split('|').Select(x => x.Split(':')).ToDictionary(x => Key(x[1]), x => x[0], StringComparer.Ordinal);
     internal static string[] DiagnosticRegions(bool ats) => ats ? UsStates.Order().ToArray() : EuCodes.Values.Except(["cyprus","malta","ireland"]).Distinct().Order().ToArray();
@@ -110,127 +109,6 @@ internal static class RealFuelPrices
         "northmacedonia" => "macedonia",
         var key => key
     };
-    internal static Feed ParseAmzs(string html, DateTime today)
-    {
-        var prices = new Dictionary<string,Price>();
-        var dates = new Dictionary<string,DateTime>();
-        var expired = new Dictionary<string,DateTime>();
-        foreach (Match table in Regex.Matches(html, @"<table\b[^>]*>(.*?)</table\s*>", RegexOptions.Singleline|RegexOptions.IgnoreCase, TimeSpan.FromSeconds(2)))
-        {
-            var rows = Row.Matches(table.Groups[1].Value);
-            if (rows.Count<2 || !Cell.Matches(rows[0].Value).Select(c=>Plain(c.Groups[1].Value)).SequenceEqual(["Država","95","98","Diesel","Zadnja sprememba"])) continue;
-            foreach (Match row in rows.Skip(1))
-            {
-                var cells=Cell.Matches(row.Value);
-                if (cells.Count!=5) continue;
-                var flag=Regex.Match(cells[0].Value,@"\bflag-icon-([a-z]{2})\b");
-                if (!EuCodes.TryGetValue(flag.Groups[1].Value,out var country)) continue;
-                if (!DateTime.TryParseExact(Plain(cells[4].Groups[1].Value),"d. M. yyyy",CultureInfo.InvariantCulture, DateTimeStyles.AllowWhiteSpaces,out var date) ||
-                    date.Date>today.Date) continue;
-                if(date.Date<today.Date.AddDays(-14)){expired[country]=date;continue;}
-                decimal? Euros(Match cell)
-                {
-                    var match=Regex.Match(Plain(cell.Groups[1].Value), @"^(?:\d+(?:[,.]\d+)? [A-Z]{3} \((?<eur>\d+(?:[,.]\d+)?) EUR\)|(?<eur>\d+(?:[,.]\d+)?) EUR)$");
-                    return decimal.TryParse(match.Groups["eur"].Value.Replace(',','.'),NumberStyles.AllowDecimalPoint,CultureInfo.InvariantCulture,out var value)&&ValidPrice(value)?value:null;
-                }
-                if (Euros(cells[3]) is not decimal diesel) continue;
-                if (!prices.TryAdd(country,new(Euros(cells[1]),diesel))) throw new InvalidDataException("Duplicate country in AMZS table");
-                dates[country]=date;
-            }
-            break;
-        }
-        if (prices.Count==0) throw new InvalidDataException("No dated EUR/l observations in the AMZS table.");
-        return new(dates.Values.Max(),prices,dates,prices.Keys.ToDictionary(k=>k,_=>AmzsSource),expired);
-    }
-    internal static Feed Parse(string html, bool ats, DateTime today)
-    {
-        string body = Plain(Regex.Replace(html, @"<(script|style)\b[^>]*>.*?</\1\s*>", " ", RegexOptions.IgnoreCase | RegexOptions.Singleline));
-        var dateMatch = ats ? Regex.Match(body, @"Price\s+as\s+of\s+(\d{1,2}/\d{1,2}/\d{2,4})", RegexOptions.IgnoreCase)
-            : Regex.Match(body, @"Weekly\s+consumer\s+prices\s*[^\d]{0,12}(\d{1,2}\s+[A-Za-z]+\s+\d{4})", RegexOptions.IgnoreCase);
-        var formats = ats ? new[] { "M/d/yy", "M/d/yyyy" } : new[] { "d MMM yyyy", "d MMMM yyyy" };
-        if (!dateMatch.Success || !DateTime.TryParseExact(dateMatch.Groups[1].Value, formats, CultureInfo.InvariantCulture, DateTimeStyles.AllowWhiteSpaces, out var date)
-            || date.Date > today.Date.AddDays(1) || date.Date < today.Date.AddDays(ats ? -7 : -45))
-            throw new InvalidDataException("Price feed date is missing, invalid or stale.");
-        var prices = new Dictionary<string, Price>(StringComparer.Ordinal);
-        bool header = false;
-        foreach (Match row in Row.Matches(html))
-        {
-            string[] fields = Cell.Matches(row.Groups[1].Value).Cast<Match>().Select(c => Plain(c.Groups[1].Value)).ToArray();
-            if (ats && fields.Length == 5 && Key(fields[0]) == "state" && Key(fields[1]) == "regular" && Key(fields[2]) == "midgrade" && Key(fields[3]) == "premium" && Key(fields[4]) == "diesel") { header = true; continue; }
-            if (!ats && fields.Length >= 3 && Key(fields[^3]) == "country" && Key(fields[^2]) == "petrol" && Key(fields[^1]) == "diesel") { header = true; continue; }
-            if (!header) continue;
-            if (ats && fields.Length != 5 || !ats && fields.Length is not (3 or 4)) continue;
-            string key = Key(ats ? fields[0] : fields[^3]);
-            if (!(ats ? UsStates : EuCountries).Contains(key)) continue;
-            if (key == "czechrepublic") key = "czechia";
-            string petrol = ats ? fields[1] : fields[^2], diesel = fields[^1];
-            decimal? a = ParseAmount(petrol, ats), b = ParseAmount(diesel, ats);
-            if (ats ? a is null && b is null : b is null) continue;
-            if (!prices.TryAdd(key, new Price(a, b, ats ? ParseAmount(fields[2], true) : null, ats ? ParseAmount(fields[3], true) : null))) throw new InvalidDataException("Duplicate region in feed: " + key);
-        }
-        if (!ats && prices.Count==0)
-        {
-            // New server-rendered catalog contains two named series in EUR/l.
-            // The weekly bulletin date only describes EU members. Other rows
-            // can be monthly observations and require an individual date.
-            var catalog=html.Replace("\\\"","\"",StringComparison.Ordinal);
-            var series=new Dictionary<string,Dictionary<string,decimal>>();
-            foreach(Match part in Regex.Matches(catalog,"\"mode\":\"(gasoline|diesel)\",\"entries\":(\\[[^\\[\\]]{1,32000}\\])",RegexOptions.CultureInvariant,TimeSpan.FromSeconds(2)))
-            {
-                using var json=JsonDocument.Parse(part.Groups[2].Value);
-                var values=new Dictionary<string,decimal>();
-                foreach(var row in json.RootElement.EnumerateArray()){
-                    if(row.ValueKind!=JsonValueKind.Object||!row.TryGetProperty("slug",out var slug)||slug.ValueKind!=JsonValueKind.String||
-                       !row.TryGetProperty("countryCode",out var code)||code.ValueKind!=JsonValueKind.String||
-                       !row.TryGetProperty("name",out var name)||name.ValueKind!=JsonValueKind.String||
-                       !row.TryGetProperty("value",out var val)||val.ValueKind!=JsonValueKind.Number||!val.TryGetDecimal(out var amount)||!ValidPrice(amount))continue;
-                    string key=Key(name.GetString()!);
-                    if(key is "switzerland" or "norway" or "unitedkingdom"||!EuropeanCountryCodes.TryGetValue(key,out var iso)||
-                       slug.GetString()!=iso||code.GetString()!=iso.ToUpperInvariant())continue;
-                    if(!values.TryAdd(key,amount))throw new InvalidDataException("Duplicate European price row");
-                }
-                if(!series.TryAdd(part.Groups[1].Value,values))throw new InvalidDataException("Ambiguous European price series");
-            }
-            if(series.TryGetValue("diesel",out var diesel)&&series.TryGetValue("gasoline",out var petrol))
-                foreach(var (key,value) in diesel)prices[key]=new(petrol.TryGetValue(key,out var gas)?gas:null,value);
-        }
-        if (prices.Count == 0) throw new InvalidDataException("No verified prices in the main table.");
-        return new(date.Date, prices);
-    }
-    // The redesigned Europe landing page may render only petrol. Country pages
-    // expose an explicitly labelled historical table with both fuels and dates.
-    internal static (DateTime Date, Price Price) ParseEuropeanCountry(string html, string countryKey, DateTime today)
-    {
-        // Verify identity against the heading, not merely the requested URL.
-        var heading = Regex.Match(html, @"<h1\b[^>]*>(.*?)</h1\s*>", RegexOptions.IgnoreCase | RegexOptions.Singleline);
-        if (!heading.Success || Key(Plain(heading.Groups[1].Value)) != "fuelpricesin" + countryKey)
-            throw new InvalidDataException("Unexpected country page.");
-        bool header = false;
-        foreach (Match row in Row.Matches(html))
-        {
-            var f = Cell.Matches(row.Groups[1].Value).Cast<Match>().Select(c => Plain(c.Groups[1].Value)).ToArray();
-            if (f.Length == 3 && Key(f[0]) == "week" && Key(f[1]) == "petrol" && Key(f[2]) == "diesel") { header = true; continue; }
-            if (!header || f.Length != 3) continue;
-            string dateText = f[0].Replace("Sept", "Sep", StringComparison.OrdinalIgnoreCase);
-            if (!DateTime.TryParseExact(dateText, new[] { "d MMM yyyy", "d MMMM yyyy", "yyyy-MM-dd" }, CultureInfo.InvariantCulture, DateTimeStyles.AllowWhiteSpaces, out var date))
-                throw new InvalidDataException("Invalid country observation date.");
-            if (date.Date > today.Date.AddDays(1) || date.Date < today.Date.AddDays(-45))
-                throw new InvalidDataException("Country observation is stale.");
-            var diesel = ParseAmount(f[2], false);
-            if (diesel is null) throw new InvalidDataException("No valid diesel price for latest country observation.");
-            return (date.Date, new Price(ParseAmount(f[1], false), diesel));
-        }
-        throw new InvalidDataException("No labelled diesel history table.");
-    }
-    private static decimal? ParseAmount(string text, bool ats)
-    {
-        var match = Regex.Match(text, ats ? @"^\$\s*(\d+(?:\.\d+)?)$" : @"^(?:€\s*)?(\d+(?:[.,]\d+)?)\s*(ct|€|EUR)?\s*/\s*L\s*[↑↓↔]?\s*$", RegexOptions.IgnoreCase);
-        if (!match.Success || !decimal.TryParse(match.Groups[1].Value.Replace(',', '.'), NumberStyles.AllowDecimalPoint, CultureInfo.InvariantCulture, out decimal amount)) return null;
-        if (ats) amount /= LitersPerUsGallon;
-        else if (match.Groups[2].Value.Equals("ct", StringComparison.OrdinalIgnoreCase)) amount /= 100m;
-        else if (!match.Groups[2].Success && !text.StartsWith('€')) return null; // never guess units
-        return amount is >= 0.15m and <= 8m ? amount : null;
-    }
     // Cache files are external input too. Never trust deserialization alone.
     private static bool ValidPrice(decimal? value) => value is >= 0.15m and <= 8m;
     internal static bool ValidFeed(Feed? feed, bool ats, DateTime today)
@@ -332,7 +210,7 @@ internal static class RealFuelPrices
         Write(archive, "manifest.sii", "SiiNunit\n{\nmod_package : .package_name {\n package_version: \"0.4\"\n display_name: \"RoadChron Real Fuel Prices 0.4 AUTO\"\n author: \"RoadChron\"\n category[]: \"other\"\n description_file: \"mod_description.txt\"\n}\n}\n");
         var oldest = feed.Prices.Keys.Select(feed.DateFor).DefaultIfEmpty(feed.Date).Min();
         var dates = oldest.Date == feed.Date.Date ? DateLabel(feed.Date) : $"{DateLabel(oldest)} to {DateLabel(feed.Date)} (includes cached observations)";
-        Write(archive, "mod_description.txt", "RoadChron Real Fuel Prices 0.4 AUTO\nObservation dates: " + dates + "\n" + ("Sources: " + string.Join("; ",feed.Prices.Keys.Select(k=>feed.Sources?.GetValueOrDefault(k)??(ats?AtsSource:EtsSource)).Distinct()) + (feed.Estimated?.Count>0?". Includes RoadChron simulation estimates, not direct region observations.":".") + (ats?" EIA data, where used: U.S. Energy Information Administration.":" EU EnergyPrices (CC BY 4.0), EU Oil Bulletin, SSB, DESNZ, BFS where used.")) + "\nCountry fuel definitions, sign board prices and currency rates. Exchange rates: " + AdBlueRealPrices.FxUrl + " (where available); supplemental blended reference rates: https://frankfurter.dev/ (where available, not ECB rates).\n");
+        Write(archive, "mod_description.txt", "RoadChron Real Fuel Prices 0.4 AUTO\nObservation dates: " + dates + "\n" + ("Sources: " + string.Join("; ",feed.Prices.Keys.Select(k=>feed.Sources?.GetValueOrDefault(k)??"RoadChron legacy cache (source unspecified)").Distinct()) + (feed.Estimated?.Count>0?". Includes RoadChron simulation estimates, not direct region observations.":".") + (ats?" US Gas Gauge (https://usgasgauge.com/gas-price-data, CC BY 4.0 https://creativecommons.org/licenses/by/4.0/) for Regular and available diesel values; EIA for remaining diesel and other grades. US Gas Gauge estimates are not EIA observations. Thank you for free data! Adapted for simulation; no endorsement.":" OpenVan.camp (https://openvan.camp/, CC BY 4.0 https://creativecommons.org/licenses/by/4.0/) where used; historical cache credits: see central dataset SOURCES.md where applicable. Thanks to the providers for freely accessible data! Prices adapted for simulation; no endorsement.")) + "\nCountry fuel definitions, sign board prices and currency rates. Exchange rates: " + AdBlueRealPrices.FxUrl + " (where available); supplemental blended reference rates: https://frankfurter.dev/ (where available, not ECB rates).\n");
         return count;
     }
     private static readonly Dictionary<string,string> UsCodes = ("AL:Alabama|AK:Alaska|AZ:Arizona|AR:Arkansas|CA:California|CO:Colorado|CT:Connecticut|DE:Delaware|DC:District of Columbia|FL:Florida|GA:Georgia|HI:Hawaii|ID:Idaho|IL:Illinois|IN:Indiana|IA:Iowa|KS:Kansas|KY:Kentucky|LA:Louisiana|ME:Maine|MD:Maryland|MA:Massachusetts|MI:Michigan|MN:Minnesota|MS:Mississippi|MO:Missouri|MT:Montana|NE:Nebraska|NV:Nevada|NH:New Hampshire|NJ:New Jersey|NM:New Mexico|NY:New York|NC:North Carolina|ND:North Dakota|OH:Ohio|OK:Oklahoma|OR:Oregon|PA:Pennsylvania|RI:Rhode Island|SC:South Carolina|SD:South Dakota|TN:Tennessee|TX:Texas|UT:Utah|VT:Vermont|VA:Virginia|WA:Washington|WV:West Virginia|WI:Wisconsin|WY:Wyoming").Split('|').Select(v=>v.Split(':')).ToDictionary(v=>v[0].ToLowerInvariant(),v=>Key(v[1]));

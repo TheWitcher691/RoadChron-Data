@@ -28,10 +28,9 @@ internal static class PublicDataHttp
         DefaultProxyCredentials=null, AutomaticDecompression=DecompressionMethods.None }, central)) {
         Timeout = TimeSpan.FromSeconds(seconds), MaxResponseContentBufferSize = maxBytes };
     private static readonly HashSet<string> Feeds = new(
-        new[] { AdBlueRealPrices.FxUrl, AdBlueRealPrices.SpainUrl, RealFuelPrices.AtsSource, RealFuelPrices.EtsSource, RealFuelPrices.AmzsSource, DefRealPrices.PilotSource, RealFuelPrices.UkSource, RealFuelPrices.NorwaySource, AdBlueRealPrices.SpainProductUrl }
+        new[] { RealFuelPrices.UsGasGaugeSource, RealFuelPrices.OpenVanSource, AdBlueRealPrices.FxUrl, AdBlueRealPrices.SpainUrl, DefRealPrices.PilotSource, AdBlueRealPrices.SpainProductUrl }
             .Concat(RealFuelPrices.EiaPages)
             .Concat(AdBlueRealPrices.Sources.Select(source => source.Url))
-            .Concat(RealFuelPrices.EuropeanCountryCodes.Values.Select(country => RealFuelPrices.EtsSource + "/" + country))
             .Select(url => new Uri(url).AbsoluteUri), StringComparer.Ordinal);
     private static readonly Regex DefCatalogPath = new(
         @"^/location/(?<state>[a-z]{2})/(?:[a-z0-9-]{1,160}/)?\z", RegexOptions.CultureInvariant);
@@ -47,16 +46,21 @@ internal static class PublicDataHttp
         return match.Success && DefRealPrices.Neighbours.ContainsKey(match.Groups["state"].Value.ToUpperInvariant());
     }
     // Publisher policy is intentionally narrower than legacy provenance validation.
-    internal static bool UkCsvAllowed(Uri? uri)=>uri is {IsAbsoluteUri:true}&&uri.Scheme=="https"&&uri.IsDefaultPort&&uri.UserInfo.Length==0&&uri.Query.Length==0&&uri.Fragment.Length==0&&uri.Host=="assets.publishing.service.gov.uk"&&Regex.IsMatch(uri.AbsolutePath,@"\A/media/[a-f0-9]{24}/(?:CSV__2018_-__|weekly_road_fuel_prices_[0-9]{6})\.csv\z");
     internal static bool CollectorAllowed(Uri? uri) => uri is {IsAbsoluteUri:true} && (
-        uri.AbsoluteUri == RealFuelPrices.EuropeCsv || uri.AbsoluteUri == new Uri(AdBlueRealPrices.SupplementFxUrl).AbsoluteUri ||
+        uri.AbsoluteUri == RealFuelPrices.UsGasGaugeRegular || uri.AbsoluteUri == RealFuelPrices.UsGasGaugeDiesel || uri.AbsoluteUri == RealFuelPrices.OpenVanPrices || uri.AbsoluteUri == RealFuelPrices.OpenVanFx || uri.AbsoluteUri == new Uri(AdBlueRealPrices.SupplementFxUrl).AbsoluteUri ||
 #if ROADCHRON_COLLECTOR
         global::EiaWorkbooks.Urls.Contains(uri.AbsoluteUri, StringComparer.Ordinal) ||
 #endif
-        UkCsvAllowed(uri)||(AdBlueRealPrices.VatEnabled&&AdBlueRealPrices.VatSources.Any(s=>s.Url==uri.AbsoluteUri))||uri.AbsoluteUri==new Uri(AdBlueRealPrices.RomaniaUrl).AbsoluteUri||uri.AbsoluteUri==new Uri(RealFuelPrices.NorwayData).AbsoluteUri||(Allowed(uri) &&
-        (uri.AbsoluteUri == AdBlueRealPrices.FxUrl || uri.AbsoluteUri == AdBlueRealPrices.SpainProductUrl ||
-         uri.AbsoluteUri == RealFuelPrices.UkSource)));
+        (AdBlueRealPrices.VatEnabled&&AdBlueRealPrices.VatSources.Any(s=>s.Url==uri.AbsoluteUri))||uri.AbsoluteUri==new Uri(AdBlueRealPrices.RomaniaUrl).AbsoluteUri||(Allowed(uri) &&
+        (uri.AbsoluteUri == AdBlueRealPrices.FxUrl || uri.AbsoluteUri == AdBlueRealPrices.SpainProductUrl)));
     internal static bool AllowedSource(string? source) => Uri.TryCreate(source,UriKind.Absolute,out var uri)&&Allowed(uri);
+    // Read-only historical provenance for the existing signed dataset; NEVER used by the HTTP gate.
+    internal static bool LegacyFuelProvenance(string? source) => source is
+        "https://gasprices.aaa.com/todays-state-averages/" or "https://www.euenergyprices.eu/en/fuel" or
+        "https://www.amzs.si/na-poti/cene-goriv-po-evropi" or
+        "https://www.gov.uk/government/statistics/weekly-road-fuel-prices" or
+        "https://www.ssb.no/en/statbank/table/09654" ||
+        RealFuelPrices.EuropeanCountryCodes.Values.Any(c=>source=="https://www.euenergyprices.eu/en/fuel/"+c);
     // Allowed() describes source provenance; only the collector build may contact those sources.
     internal sealed class Gate(string root, HttpMessageHandler transport, Uri? central = null) : DelegatingHandler(transport)
     {

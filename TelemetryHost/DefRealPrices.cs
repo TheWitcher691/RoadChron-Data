@@ -79,7 +79,7 @@ internal static class DefRealPrices
         // EIA prices are USD/l; they are a proxy for regional distribution costs, NEVER DEF measurements.
         var proxy=new Dictionary<string,decimal>();
         if(diesel!=null)foreach(var (state,key) in StateNames){
-            if(diesel.Sources?.GetValueOrDefault(key)!=RealFuelPrices.EiaSource||diesel.DateFor(key)<now.Date.AddDays(-30)||diesel.DateFor(key)>now.Date.AddDays(1))continue;
+            if(!RealFuelPrices.ApprovedUsSource(diesel.Sources?.GetValueOrDefault(key))||diesel.DateFor(key)<now.Date.AddDays(-30)||diesel.DateFor(key)>now.Date.AddDays(1))continue;
             if(diesel.Prices.TryGetValue(key,out var fuel)&&fuel.Diesel is decimal p&&p*LitresPerGallon is >=1m and <=12m)proxy[state]=p*LitresPerGallon;
         }
         var fuelLevels=proxy.Values.Order().ToArray();

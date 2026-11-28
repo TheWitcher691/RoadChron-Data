@@ -17,9 +17,11 @@ internal static class CentralPriceFeed
         Dictionary<string,ProviderStatus>? Providers = null);
     internal sealed record ProviderStatus(string State, string? Detail = null);
     internal static readonly HashSet<string> ProviderNames = [
-        "EIA Petrol", "EIA Diesel", "EIA MidGrade", "EIA Premium", "EU EnergyPrices",
-        "UK DESNZ", "Norway SSB", "ECB", "Frankfurter FX", "MITECO", "PretCarburant RO", "VATservice"
+        "USGasGauge Regular", "USGasGauge Diesel", "EIA Petrol", "EIA Diesel", "EIA MidGrade", "EIA Premium",
+        "OpenVan", "ECB", "Frankfurter FX", "MITECO", "PretCarburant RO", "VATservice"
     ];
+    // Verify older signed publications during migration; not active provider names.
+    private static bool LegacyProvider(string name) => name is "EU EnergyPrices" or "UK DESNZ" or "Norway SSB";
     internal sealed record Envelope(string Payload, string Signature);
     private static readonly SemaphoreSlim Gate = new(1);
     private static readonly Lazy<Config?> BuiltIn = new(ReadConfiguration);
@@ -64,7 +66,7 @@ internal static class CentralPriceFeed
         if(p.Schema!=1||p.GeneratedUtc.Kind!=DateTimeKind.Utc||p.GeneratedUtc>now.AddMinutes(5)||p.GeneratedUtc==DateTime.MinValue||
             (!allowExpired&&p.GeneratedUtc<now.AddDays(-30))||p.AdBlue==null||p.Def==null||p.AdBlue.Count>100||p.Def.Count>51)
             throw new InvalidDataException("Invalid schema, timestamp or collection size.");
-        if(p.Providers?.Any(v=>!ProviderNames.Contains(v.Key)||v.Value==null||
+        if(p.Providers?.Any(v=>(!ProviderNames.Contains(v.Key)&&!LegacyProvider(v.Key))||v.Value==null||
             v.Value.State is not ("ok" or "failed" or "skipped" or "partial")||
             v.Value.Detail?.Length>300)==true)throw new InvalidDataException("Invalid provider diagnostics.");
         var reference=p.GeneratedUtc;
@@ -72,7 +74,7 @@ internal static class CentralPriceFeed
             if(feed==null)continue;
             if(!RealFuelPrices.ValidFeed(feed,ats,reference)||feed.Date.Date>reference.Date.AddDays(1)||feed.Prices.Count>60||
                 feed.Prices.Keys.Any(k=>feed.DateFor(k).Date<reference.Date.AddDays(-Math.Max(30,RealFuelPrices.ObservationAgeDays(k))))||
-                feed.Sources?.Any(s=>!feed.Prices.ContainsKey(s.Key)||!PublicDataHttp.AllowedSource(s.Value))==true)
+                feed.Sources?.Any(s=>!feed.Prices.ContainsKey(s.Key)||(!PublicDataHttp.AllowedSource(s.Value)&&!PublicDataHttp.LegacyFuelProvenance(s.Value)))==true)
                 throw new InvalidDataException("Invalid fuel observations.");
         }
         var sourceKeys=new HashSet<(string,string)>();
